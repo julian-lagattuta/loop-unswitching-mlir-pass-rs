@@ -1,0 +1,4 @@
+# melior 0.27 / mlir-sys 220 require LLVM + MLIR 22.x.
+[env]
+MLIR_SYS_220_PREFIX = "/usr/lib/llvm-22"
+TABLEGEN_220_PREFIX = "/usr/lib/llvm-22"
