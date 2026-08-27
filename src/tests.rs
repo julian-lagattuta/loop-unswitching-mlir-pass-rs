@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
 
 use melior::{
     Context,
@@ -874,13 +874,121 @@ fn block_capabilities_promotes_loop_access_and_finds_parent_iterator() {
     assert_eq!(found_iterator.to_raw().ptr, iterator.to_raw().ptr);
 
     let mut capabilities = vec![];
-    block_capabilities(body, &mut capabilities);
+    let mut capability_map = HashMap::new();
+    block_capabilities(body, &mut capability_map, &mut capabilities);
 
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability_type, CapabilityType::Shrd);
     let (start, end) = capabilities[0].capability_expr.as_ref().unwrap();
     assert!(matches!(start, CapabilityExpr::Constant(0)));
     assert_eq!(end.constant_propagate(), Some(3));
+
+    let loop_capabilities = capability_map.get(&for_loop.to_raw().ptr).unwrap();
+    assert_eq!(loop_capabilities.len(), 1);
+    assert_eq!(loop_capabilities[0].capability_type, CapabilityType::Shrd);
+    let (start, end) = loop_capabilities[0].capability_expr.as_ref().unwrap();
+    assert_eq!(start.to_string(), "i");
+    assert_eq!(end.constant_propagate(), Some(3));
+}
+
+#[test]
+fn block_capabilities_tracks_increasing_and_decreasing_unique_loop_caps() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+                module {
+                    func.func @write(%increasing: memref<4xi32>, %decreasing: memref<4xi32>, %value: i32) {
+                        %c0 = arith.constant 0 : index
+                        %c1 = arith.constant 1 : index
+                        %c2 = arith.constant 2 : index
+                        %c3 = arith.constant 3 : index
+                        %c4 = arith.constant 4 : index
+                        scf.for %i = %c2 to %c4 step %c1 {
+                            memref.store %value, %increasing[%i] : memref<4xi32>
+                            scf.yield
+                        }
+                        scf.for %i = %c0 to %c4 step %c1 {
+                            %index = arith.subi %c3, %i : index
+                            memref.store %value, %decreasing[%index] : memref<4xi32>
+                            scf.yield
+                        }
+                        return
+                    }
+                }
+            "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let loops: Vec<_> = super::util::BlockIter::new(body)
+        .filter(|operation| operation.name().as_string_ref().as_str().unwrap() == "scf.for")
+        .collect();
+    let mut capability_map = HashMap::new();
+    let mut capabilities = Vec::new();
+
+    block_capabilities(body, &mut capability_map, &mut capabilities);
+
+    let increasing = capability_map.get(&loops[0].to_raw().ptr).unwrap();
+    assert_eq!(increasing.len(), 2);
+    assert_eq!(increasing[0].capability_type, CapabilityType::Uniq);
+    assert_eq!(increasing[1].capability_type, CapabilityType::Shrd);
+    let (uniq_start, uniq_end) = increasing[0].capability_expr.as_ref().unwrap();
+    let (shrd_start, shrd_end) = increasing[1].capability_expr.as_ref().unwrap();
+    assert_eq!(uniq_start.to_string(), "2 + i");
+    assert_eq!(uniq_end.constant_propagate(), Some(3));
+    assert_eq!(shrd_start.constant_propagate(), Some(2));
+    assert_eq!(shrd_end.to_string(), "2 + i - 1");
+
+    let decreasing = capability_map.get(&loops[1].to_raw().ptr).unwrap();
+    assert_eq!(decreasing.len(), 2);
+    assert_eq!(decreasing[0].capability_type, CapabilityType::Uniq);
+    assert_eq!(decreasing[1].capability_type, CapabilityType::Shrd);
+    let (uniq_start, uniq_end) = decreasing[0].capability_expr.as_ref().unwrap();
+    let (shrd_start, shrd_end) = decreasing[1].capability_expr.as_ref().unwrap();
+    assert_eq!(uniq_start.constant_propagate(), Some(0));
+    assert_eq!(uniq_end.to_string(), "3 - i");
+    assert_eq!(shrd_start.to_string(), "3 - i + 1");
+    assert_eq!(shrd_end.constant_propagate(), Some(3));
+}
+
+#[test]
+fn block_capabilities_keeps_poison_for_loop_caps_poisoned() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+                module {
+                    func.func @write(%array: memref<16xi32>, %value: i32) {
+                        %c0 = arith.constant 0 : index
+                        %c1 = arith.constant 1 : index
+                        %c4 = arith.constant 4 : index
+                        scf.for %i = %c0 to %c4 step %c1 {
+                            %shifted = arith.subi %i, %c1 : index
+                            %index = arith.muli %shifted, %shifted : index
+                            memref.store %value, %array[%index] : memref<16xi32>
+                            scf.yield
+                        }
+                        return
+                    }
+                }
+            "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let for_loop = super::util::BlockIter::new(body)
+        .find(|operation| operation.name().as_string_ref().as_str().unwrap() == "scf.for")
+        .unwrap();
+    let mut capability_map = HashMap::new();
+    let mut capabilities = Vec::new();
+
+    block_capabilities(body, &mut capability_map, &mut capabilities);
+
+    let loop_capabilities = capability_map.get(&for_loop.to_raw().ptr).unwrap();
+    assert_eq!(loop_capabilities.len(), 1);
+    assert_eq!(loop_capabilities[0].capability_type, CapabilityType::Uniq);
+    assert!(loop_capabilities[0].capability_expr.is_none());
 }
 
 #[test]
@@ -914,7 +1022,8 @@ fn block_capabilities_handles_flattened_2d_array_access() {
     let body = function.first_region().unwrap().first_block().unwrap();
     let mut capabilities = vec![];
 
-    block_capabilities(body, &mut capabilities);
+    let mut capability_map = HashMap::new();
+    block_capabilities(body, &mut capability_map, &mut capabilities);
 
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability_type, CapabilityType::Shrd);
@@ -931,7 +1040,8 @@ fn block_capabilities_handles_nested_quadratic_access() {
     let body = function.first_region().unwrap().first_block().unwrap();
     let mut capabilities = vec![];
 
-    block_capabilities(body, &mut capabilities);
+    let mut capability_map = HashMap::new();
+    block_capabilities(body, &mut capability_map, &mut capabilities);
 
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability_type, CapabilityType::Uniq);
@@ -968,7 +1078,8 @@ fn block_capabilities_handles_increasing_then_decreasing_accesses() {
     let body = function.first_region().unwrap().first_block().unwrap();
     let mut capabilities = vec![];
 
-    block_capabilities(body, &mut capabilities);
+    let mut capability_map = HashMap::new();
+    block_capabilities(body, &mut capability_map, &mut capabilities);
 
     assert_eq!(capabilities.len(), 2);
     for capability in &capabilities {
@@ -1011,7 +1122,8 @@ fn block_capabilities_handles_increasing_intervals_with_decreasing_indices() {
     let body = function.first_region().unwrap().first_block().unwrap();
     let mut capabilities = vec![];
 
-    block_capabilities(body, &mut capabilities);
+    let mut capability_map = HashMap::new();
+    block_capabilities(body, &mut capability_map, &mut capabilities);
 
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability_type, CapabilityType::Shrd);
@@ -1052,7 +1164,8 @@ fn block_capabilities_handles_decreasing_intervals_with_increasing_indices() {
     let body = function.first_region().unwrap().first_block().unwrap();
     let mut capabilities = vec![];
 
-    block_capabilities(body, &mut capabilities);
+    let mut capability_map = HashMap::new();
+    block_capabilities(body, &mut capability_map, &mut capabilities);
 
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability_type, CapabilityType::Shrd);

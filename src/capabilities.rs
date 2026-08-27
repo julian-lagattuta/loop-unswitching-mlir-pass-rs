@@ -621,6 +621,7 @@ where 'c: 'a
             func.region(0).unwrap().first_block().unwrap(), 
             &mut map, &mut caps
         );
+        hashmap.extend(map);
         hashmap.insert(func.to_raw().ptr, caps);
     }
     hashmap
@@ -704,6 +705,15 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
             let is_range_poisoned = lower_bound.is_none() || upper_bound.is_none();
             let step =
                 generate_expr(step_var, Some(current)).and_then(|step| step.constant_propagate());
+            let iterator: Value<'c, 'a> = inner_block.argument(0).unwrap().into();
+            let iteration = lower_bound.as_ref().map(|lower_bound| CapabilityExpr::BinOp {
+                operation: CapabilityOp::Add,
+                operands: (
+                    Rc::clone(lower_bound),
+                    Rc::new(CapabilityExpr::Variable(iterator)),
+                ),
+            });
+            let mut loop_capabilities = Vec::new();
 
             for capability in inner_capabilities {
                 let Capability {
@@ -717,13 +727,15 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
                         if has_iteration_variable(&start) || has_iteration_variable(&end) =>
                     {
                         if is_range_poisoned || step.is_none() {
+                            let loop_capability = Capability {
+                                array,
+                                capability_type,
+                                capability_expr: None,
+                            };
+                            push_capability(&mut loop_capabilities, loop_capability.clone());
                             let inserted = push_capability(
                                 capabilities,
-                                Capability {
-                                    array,
-                                    capability_type,
-                                    capability_expr: None,
-                                },
+                                loop_capability,
                             );
                             println!(
                                 "[block_capabilities] poisoned loop capability because a loop bound is unknown; inserted={inserted}"
@@ -733,6 +745,20 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
 
                         let pattern = z3_for_loop_viability(&start, &end, &upper_bound_var);
                         println!("[block_capabilities] loop access pattern: {pattern:?}");
+
+                        for loop_capability in loop_function_capabilities(
+                            array,
+                            capability_type,
+                            &start,
+                            &end,
+                            lower_bound.as_ref().unwrap(),
+                            upper_bound.as_ref().unwrap(),
+                            iteration.as_ref().unwrap(),
+                            pattern,
+                            current,
+                        ) {
+                            push_capability(&mut loop_capabilities, loop_capability);
+                        }
 
                         let inserted = push_capability(
                             capabilities,
@@ -759,6 +785,14 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
                         }
                     }
                     capability_expr => {
+                        push_capability(
+                            &mut loop_capabilities,
+                            Capability {
+                                array,
+                                capability_type,
+                                capability_expr: capability_expr.clone(),
+                            },
+                        );
                         let inserted = push_capability(
                             capabilities,
                             Capability {
@@ -778,6 +812,7 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
                     }
                 }
             }
+            capability_map.insert(current.to_raw().ptr, loop_capabilities);
         }
         
         current_opt = current.next_in_block();
@@ -788,6 +823,97 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
         capabilities.len(),
         format_capabilities(capabilities)
     );
+}
+
+fn loop_function_capabilities<'c, 'a>(
+    array: Value<'c, 'a>,
+    capability_type: CapabilityType,
+    x: &CapabilityExpr<'c, 'a>,
+    y: &CapabilityExpr<'c, 'a>,
+    lower_bound: &CapabilityExpr<'c, 'a>,
+    upper_bound_exclusive: &CapabilityExpr<'c, 'a>,
+    iteration: &CapabilityExpr<'c, 'a>,
+    pattern: Pattern,
+    for_loop: OperationRef<'c, 'a>,
+) -> Vec<Capability<'c, 'a>> {
+    if pattern == Pattern::Poison {
+        return vec![Capability {
+            array,
+            capability_type,
+            capability_expr: None,
+        }];
+    }
+
+    let upper_bound = CapabilityExpr::BinOp {
+        operation: CapabilityOp::Sub,
+        operands: (
+            Rc::new(upper_bound_exclusive.clone()),
+            Rc::new(CapabilityExpr::Constant(1)),
+        ),
+    };
+
+    let promoted = match pattern {
+        Pattern::Increasing => {
+            let current_start = x.promote(iteration, Some(for_loop));
+            let first_start = x.promote(lower_bound, Some(for_loop));
+            let last_end = y.promote(&upper_bound, Some(for_loop));
+            current_start.zip(first_start).zip(last_end).map(
+                |((current_start, first_start), last_end)| {
+                    let shared_end = CapabilityExpr::BinOp {
+                        operation: CapabilityOp::Sub,
+                        operands: (
+                            Rc::new(current_start.clone()),
+                            Rc::new(CapabilityExpr::Constant(1)),
+                        ),
+                    };
+                    (current_start, last_end, first_start, shared_end)
+                },
+            )
+        }
+        Pattern::Decreasing => {
+            let current_end = y.promote(iteration, Some(for_loop));
+            let last_start = x.promote(&upper_bound, Some(for_loop));
+            let first_end = y.promote(lower_bound, Some(for_loop));
+            current_end.zip(last_start).zip(first_end).map(
+                |((current_end, last_start), first_end)| {
+                    let shared_start = CapabilityExpr::BinOp {
+                        operation: CapabilityOp::Add,
+                        operands: (
+                            Rc::new(current_end.clone()),
+                            Rc::new(CapabilityExpr::Constant(1)),
+                        ),
+                    };
+                    (last_start, current_end, shared_start, first_end)
+                },
+            )
+        }
+        Pattern::Poison => unreachable!(),
+    };
+
+    let Some((capability_start, capability_end, shared_start, shared_end)) = promoted
+    else {
+        return vec![Capability {
+            array,
+            capability_type,
+            capability_expr: None,
+        }];
+    };
+
+    let mut capabilities = vec![Capability {
+        array,
+        capability_type,
+        capability_expr: Some((capability_start, capability_end)),
+    }];
+
+    if capability_type == CapabilityType::Uniq {
+        capabilities.push(Capability {
+            array,
+            capability_type: CapabilityType::Shrd,
+            capability_expr: Some((shared_start, shared_end)),
+        });
+    }
+
+    capabilities
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -384,11 +384,16 @@ fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<
         .unwrap();
     
     let params: Vec<TypedVar> = find_free_variables(block).iter().map(value_to_typed_var).collect();
+    let caps = to_wavelet_capability(
+        cap_map
+            .get(&for_loop.to_raw().ptr)
+            .expect("missing capabilities for scf.for"),
+    );
     let func: FnDef<UntypedVar> = FnDef{
         name: wavelet_elab::FnName(for_loop_to_function_name(&for_loop)),
         params,
         alloc_arrays: Vec::new(),
-        caps: todo!(),
+        caps,
         returns: todo!(),
         body: todo!(),
     };
