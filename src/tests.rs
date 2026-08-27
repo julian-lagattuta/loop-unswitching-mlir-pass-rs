@@ -649,6 +649,57 @@ fn capability_constants_folds_constant_values_in_the_capability_map() {
 }
 
 #[test]
+fn partition_captured_values_materializes_constants_instead_of_parameters() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+                module {
+                    func.func @test(%dynamic: index) {
+                        %c2 = arith.constant 2 : index
+                        %c3 = arith.constant 3 : index
+                        %sum = arith.addi %c2, %c3 : index
+                        return
+                    }
+                }
+            "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let block = function.first_region().unwrap().first_block().unwrap();
+    let dynamic: Value<'_, '_> = block.argument(0).unwrap().into();
+    let c2: Value<'_, '_> = block.first_operation().unwrap().result(0).unwrap().into();
+    let sum: Value<'_, '_> = block
+        .first_operation()
+        .unwrap()
+        .next_in_block()
+        .unwrap()
+        .next_in_block()
+        .unwrap()
+        .result(0)
+        .unwrap()
+        .into();
+
+    let (parameters, constants) = super::partition_captured_values(&[dynamic, c2, sum]);
+
+    assert_eq!(parameters.len(), 1);
+    assert_eq!(parameters[0].name, super::value_to_name(&dynamic));
+    assert!(matches!(
+        constants.as_slice(),
+        [
+            wavelet_elab::Stmt::LetVal {
+                val: wavelet_elab::Val::Int(2),
+                ..
+            },
+            wavelet_elab::Stmt::LetVal {
+                val: wavelet_elab::Val::Int(5),
+                ..
+            }
+        ]
+    ));
+}
+
+#[test]
 fn promote_replaces_variables_and_only_selected_blackboxes() {
     let context = test_context();
     let module = Module::parse(
@@ -1073,7 +1124,7 @@ fn for_loop_function_parameters_include_unused_iter_args() {
     let carried: Value<'_, '_> = loop_body.argument(1).unwrap().into();
     let (upper_bound, step) = super::for_loop_parameter_values(for_loop);
 
-    let parameters = super::for_loop_function_parameters(for_loop, &upper_bound, &step);
+    let (parameters, _) = super::for_loop_function_captures(for_loop, &upper_bound, &step);
 
     assert!(parameters
         .iter()

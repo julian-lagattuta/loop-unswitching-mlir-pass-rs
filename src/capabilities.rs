@@ -489,7 +489,7 @@ where
     generate_expr_helper(value, target_for_loop)
 }
 
-fn constant_fold_value(value: Value<'_, '_>) -> Option<i64> {
+pub(super) fn constant_fold_value(value: Value<'_, '_>) -> Option<i64> {
     let operation = OperationResult::try_from(value).ok()?.owner();
     let ident = operation.name();
     let name = ident.as_string_ref().as_str().ok()?;

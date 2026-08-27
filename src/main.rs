@@ -13,7 +13,7 @@ mod rename_variables;
 use capabilities::print_return_expressions;
 use wavelet_elab::{Expr, FnDef, Op, Program, Stmt, Tail, Ty, TypedVar, UntypedVar, Val, ir::{ArrayLen, Signedness}};
 
-use crate::{capabilities::{Capability, compute_capabilities, generate_expr, to_wavelet_capability}, program_to_wavelet::program_to_wavelet, rename_variables::rename_program_variables, util::{BlockIter, FreshWaveletNames, fresh_wavelet_name}};
+use crate::{capabilities::{Capability, capability_constants, compute_capabilities, constant_fold_value, generate_expr, to_wavelet_capability}, program_to_wavelet::program_to_wavelet, rename_variables::rename_program_variables, util::{BlockIter, FreshWaveletNames, fresh_wavelet_name}};
 fn scf_to_wavelet<'c>(module: Module<'c>) -> Option<Program<UntypedVar>> {
     todo!("ds");
     None
@@ -451,20 +451,40 @@ impl TailCallInformation {
         }
     }
 }
-fn for_loop_function_parameters<'c, 'a>(
+fn partition_captured_values(values: &[Value<'_, '_>]) -> (Vec<TypedVar>, Vec<Stmt<UntypedVar>>) {
+    let mut parameters = Vec::new();
+    let mut constants = Vec::new();
+    for value in values {
+        if let Some(constant) = constant_fold_value(*value) {
+            let val = if value_to_wavelet_ty(value) == Ty::Bool {
+                Val::Bool(constant != 0)
+            } else {
+                Val::Int(constant)
+            };
+            constants.push(Stmt::LetVal {
+                var: UntypedVar(value_to_name(value)),
+                val,
+                fence: false,
+            });
+        } else {
+            parameters.push(value_to_typed_var(value));
+        }
+    }
+    (parameters, constants)
+}
+
+fn for_loop_function_captures<'c, 'a>(
     for_loop: OperationRef<'c, 'a>,
     upper_bound: &ForLoopParameterValue,
     step: &ForLoopParameterValue,
-) -> Vec<TypedVar> {
+) -> (Vec<TypedVar>, Vec<Stmt<UntypedVar>>) {
     let block = for_loop
         .first_region()
         .unwrap()
         .first_block()
         .unwrap();
-    let mut parameters: Vec<TypedVar> = find_free_variables(block)
-        .iter()
-        .map(value_to_typed_var)
-        .collect();
+    let free_variables = find_free_variables(block);
+    let (mut parameters, constants) = partition_captured_values(&free_variables);
 
     for parameter_value in [upper_bound, step] {
         if let ForLoopParameterValue::Variable(parameter) = parameter_value
@@ -486,7 +506,7 @@ fn for_loop_function_parameters<'c, 'a>(
         }
     }
 
-    parameters
+    (parameters, constants)
 }
 fn if_to_wavelet<'c, 'a>(
     if_statement: OperationRef<'c, 'a>,
@@ -510,10 +530,7 @@ fn if_to_wavelet<'c, 'a>(
             }
         }
     }
-    let parameters: Vec<TypedVar> = parameter_values
-        .iter()
-        .map(value_to_typed_var)
-        .collect();
+    let (parameters, constant_statements) = partition_captured_values(&parameter_values);
     let arguments = parameters
         .iter()
         .map(|parameter| UntypedVar(parameter.name.clone()))
@@ -556,7 +573,7 @@ fn if_to_wavelet<'c, 'a>(
         caps,
         returns,
         body: Expr {
-            stmts: Vec::new(),
+            stmts: constant_statements,
             tail: Tail::IfElse {
                 cond: condition,
                 then_e: Box::new(then_e),
@@ -583,7 +600,8 @@ fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<
         .first_block()
         .unwrap();
     let (upper_bound, step) = for_loop_parameter_values(for_loop);
-    let params = for_loop_function_parameters(for_loop, &upper_bound, &step);
+    let (params, mut body_stmts) =
+        for_loop_function_captures(for_loop, &upper_bound, &step);
     let caps = to_wavelet_capability(
         cap_map
             .get(&for_loop.to_raw().ptr)
@@ -603,7 +621,6 @@ fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<
     let carried_argument = (block.argument_count() == 2).then(|| {
         UntypedVar(value_to_name(&block.argument(1).unwrap().into()))
     });
-    let mut body_stmts = Vec::new();
     let upper_bound = match upper_bound {
         ForLoopParameterValue::Constant(value) => {
             let variable = UntypedVar(generator.fresh("_upper_bound"));
@@ -844,6 +861,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut program = Program { defs: Vec::new() };
     let mut func = module.as_operation().first_region().unwrap().first_block().unwrap().first_operation().unwrap();
     let mut cap_map = compute_capabilities(&module);
+    capability_constants(&mut cap_map);
     function_to_wavelet(func, &mut program, &mut cap_map);
     rename_program_variables(&mut program);
 
