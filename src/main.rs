@@ -8,10 +8,12 @@ use melior::{
 mod capabilities;
 mod loop_unswitching;
 mod util;
+mod program_to_wavelet;
+mod rename_variables;
 use capabilities::print_return_expressions;
 use wavelet_elab::{Expr, FnDef, Op, Program, Stmt, Tail, Ty, TypedVar, UntypedVar, Val, ir::{ArrayLen, Signedness}};
 
-use crate::{capabilities::{Capability, generate_expr, to_wavelet_capability}, util::{BlockIter, FreshWaveletNames, fresh_wavelet_name}};
+use crate::{capabilities::{Capability, compute_capabilities, generate_expr, to_wavelet_capability}, program_to_wavelet::program_to_wavelet, rename_variables::rename_program_variables, util::{BlockIter, FreshWaveletNames, fresh_wavelet_name}};
 fn scf_to_wavelet<'c>(module: Module<'c>) -> Option<Program<UntypedVar>> {
     todo!("ds");
     None
@@ -236,6 +238,20 @@ fn value_to_name(value: &Value<'_, '_>) -> String {
     let t= format!("v{:p}",value.to_raw().ptr);
     t
 }
+fn function_to_name(function: &OperationRef<'_, '_>) -> String {
+    let quoted_name = StringAttribute::try_from(
+        function
+            .attribute("sym_name")
+            .expect("func.func must have a sym_name attribute"),
+    )
+    .expect("func.func sym_name must be a string attribute")
+    .to_string();
+    assert!(
+        quoted_name.len() >= 2,
+        "func.func sym_name must include surrounding quotation marks"
+    );
+    quoted_name[1..quoted_name.len() - 1].to_string()
+}
 fn for_loop_to_function_name(for_loop: &OperationRef<'_, '_>) -> String{
     let t= format!("f{:p}",for_loop.to_raw().ptr);
     t
@@ -349,7 +365,7 @@ fn function_to_wavelet<'c, 'a>(func: OperationRef<'c, 'a>, program: &mut Program
             }
         }
     }
-    let name = StringAttribute::try_from(func.attribute("sym_name").unwrap()).unwrap();
+    let name = function_to_name(&func);
     let caps = func_map.get(&func.to_raw().ptr).unwrap();
     let caps = to_wavelet_capability(caps);
 
@@ -364,7 +380,7 @@ fn function_to_wavelet<'c, 'a>(func: OperationRef<'c, 'a>, program: &mut Program
 
     let body = block_to_wavelet(block, program, None,func_map);
     let wavelet_func = wavelet_elab::FnDef{
-        name: wavelet_elab::FnName(name.to_string()), 
+        name: wavelet_elab::FnName(name),
         params: arguments, 
         alloc_arrays,
         caps, 
@@ -662,8 +678,13 @@ fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<
         },
     };
 
-    let untyped_params: Vec<UntypedVar> = params.iter().map(|p| 
-        UntypedVar(p.name.clone())
+    let lower_bound = for_loop.operand(0).unwrap();
+    let untyped_params: Vec<UntypedVar> = params.iter().map(|p|
+        if p.name == iteration_argument.0 {
+            UntypedVar(value_to_name(&lower_bound))
+        } else {
+            UntypedVar(p.name.clone())
+        }
     ).collect();
     let func: FnDef<UntypedVar> = FnDef{
         name: function_name,
@@ -818,10 +839,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 
     
-    print_return_expressions(&module);
-    loop_unswitching::loop_unswitch(&context, &mut module);
+    // print_return_expressions(&module);
+    // loop_unswitching::loop_unswitch(&context, &mut module);
+    let mut program = Program { defs: Vec::new() };
+    let mut func = module.as_operation().first_region().unwrap().first_block().unwrap().first_operation().unwrap();
+    let mut cap_map = compute_capabilities(&module);
+    function_to_wavelet(func, &mut program, &mut cap_map);
+    rename_program_variables(&mut program);
 
-    fs::write(output_path, module.as_operation().to_string())?;
+
+    fs::write(output_path, program_to_wavelet(&program))?;
     if !module.as_operation().verify() {
         println!("failed to verify");
     }

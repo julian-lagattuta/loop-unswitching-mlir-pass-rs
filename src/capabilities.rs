@@ -304,6 +304,40 @@ pub(super) struct Capability<'c, 'a> {
     pub(super) capability_type: CapabilityType,
     pub(super) capability_expr: Option<(CapabilityExpr<'c, 'a>, CapabilityExpr<'c, 'a>)>, // None means "poison" which takes the entire bounds of the array
 }
+
+pub(super) fn capability_constants<'c, 'a>(
+    capability_map: &mut HashMap<*mut c_void, Vec<Capability<'c, 'a>>>,
+) {
+    fn replace_constants<'c, 'a>(expression: &CapabilityExpr<'c, 'a>) -> CapabilityExpr<'c, 'a> {
+        let replaced = match expression {
+            CapabilityExpr::BinOp {
+                operation,
+                operands,
+            } => CapabilityExpr::BinOp {
+                operation: *operation,
+                operands: (
+                    Rc::new(replace_constants(&operands.0)),
+                    Rc::new(replace_constants(&operands.1)),
+                ),
+            },
+            CapabilityExpr::Blackbox(value) => constant_fold_value(*value)
+                .map(CapabilityExpr::Constant)
+                .unwrap_or_else(|| expression.clone()),
+            CapabilityExpr::Constant(_) | CapabilityExpr::Variable(_) => expression.clone(),
+        };
+        replaced.simplified()
+    }
+
+    for capabilities in capability_map.values_mut() {
+        for capability in capabilities {
+            if let Some((start, end)) = &mut capability.capability_expr {
+                *start = replace_constants(start);
+                *end = replace_constants(end);
+            }
+        }
+    }
+}
+
 pub(super) fn to_wavelet_capability(
     capabilities: &[Capability<'_, '_>],
 ) -> Vec<CapPattern> {

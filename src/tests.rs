@@ -8,8 +8,9 @@ use melior::{
 };
 
 use super::capabilities::{
-    CapabilityExpr, CapabilityOp, CapabilityType, Pattern, block_capabilities,
-    find_parent_iterator, format_capabilities, generate_expr, z3_for_loop_viability,
+    Capability, CapabilityExpr, CapabilityOp, CapabilityType, Pattern, block_capabilities,
+    capability_constants, find_parent_iterator, format_capabilities, generate_expr,
+    z3_for_loop_viability,
 };
 
     fn test_context() -> Context {
@@ -74,6 +75,25 @@ use super::capabilities::{
                 wavelet_elab::ir::Signedness::Signed
             )
         );
+    }
+
+    #[test]
+    fn function_to_name_removes_surrounding_quotation_marks() {
+        let context = test_context();
+        let module = Module::parse(
+            &context,
+            r#"
+                module {
+                    func.func @example_function() {
+                        return
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let function = module.body().first_operation().unwrap();
+
+        assert_eq!(super::function_to_name(&function), "example_function");
     }
 
     #[test]
@@ -570,6 +590,62 @@ fn constant_propagate_evaluates_constant_trees() {
         CapabilityExpr::Constant(1),
     );
     assert_eq!(overflow.constant_propagate(), None);
+}
+
+#[test]
+fn capability_constants_folds_constant_values_in_the_capability_map() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+                module {
+                    func.func @test(%array: memref<10xi32>) {
+                        %c2 = arith.constant 2 : index
+                        %c3 = arith.constant 3 : index
+                        %sum = arith.addi %c2, %c3 : index
+                        return
+                    }
+                }
+            "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let block = function.first_region().unwrap().first_block().unwrap();
+    let array: Value<'_, '_> = block.argument(0).unwrap().into();
+    let sum: Value<'_, '_> = block
+        .first_operation()
+        .unwrap()
+        .next_in_block()
+        .unwrap()
+        .next_in_block()
+        .unwrap()
+        .result(0)
+        .unwrap()
+        .into();
+    let mut capability_map = HashMap::from([(
+        function.to_raw().ptr,
+        vec![Capability {
+            array,
+            capability_type: CapabilityType::Shrd,
+            capability_expr: Some((
+                CapabilityExpr::Blackbox(sum),
+                bin_op(
+                    CapabilityOp::Add,
+                    CapabilityExpr::Blackbox(sum),
+                    CapabilityExpr::Constant(1),
+                ),
+            )),
+        }],
+    )]);
+
+    capability_constants(&mut capability_map);
+
+    let (start, end) = capability_map[&function.to_raw().ptr][0]
+        .capability_expr
+        .as_ref()
+        .unwrap();
+    assert_eq!(start.constant_propagate(), Some(5));
+    assert_eq!(end.constant_propagate(), Some(6));
 }
 
 #[test]

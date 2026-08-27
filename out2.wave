@@ -1,0 +1,42 @@
+#[cap(arg2: shrd @ arg0 * 10 + arg1..arg0 * 10 + 10)]
+fn f0x58ea39f8b610(arg0: i32, arg1: i32, arg2: &mut [i32; 100]) {
+    let v0 = 10;
+    let v1 = 1;
+    let v2 = arg1 < v0;
+    if v2 {
+        let v3 = arg1 + v1;
+        let v4 = 10;
+        let v5 = arg0 * v4;
+        let v6 = v5 + arg1;
+        let v7 = arg2[v6];
+        f0x58ea39f8b610(arg0, v3, arg2)
+    } else {
+        let v8 = ();
+        v8
+    }
+}
+
+#[cap(arg4: shrd @ arg3 * 10..100)]
+fn f0x58ea39f8b3c0(arg0: i32, arg1: i32, arg2: i32, arg3: i32, arg4: &mut [i32; 100]) {
+    let v0 = 10;
+    let v1 = 1;
+    let v2 = arg3 < v0;
+    if v2 {
+        let v3 = arg3 + v1;
+        let v4 = f0x58ea39f8b610(arg3, arg0, arg4);
+        f0x58ea39f8b3c0(arg0, arg1, arg2, v3, arg4)
+    } else {
+        let v5 = ();
+        v5
+    }
+}
+
+#[cap(arg0: shrd @ 0..100)]
+fn read_2d(arg0: &mut [i32; 100]) {
+    let v0 = 0;
+    let v1 = 1;
+    let v2 = 10;
+    let v3 = f0x58ea39f8b3c0(v0, v2, v1, v0, arg0);
+    let v4 = ();
+    v4
+}
