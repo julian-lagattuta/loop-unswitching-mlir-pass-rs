@@ -27,7 +27,7 @@ fn unswitch_loop<'c, 'a, 'd, 'q>(
     let condition = op.operand(0).unwrap();
     let last_loop = for_loop;
 
-    let mut modified_regions: [Region; 2] = [Region::new(), Region::new()];
+    let modified_regions: [Region; 2] = [Region::new(), Region::new()];
     op.set_attribute(
         "__marker",
         BoolAttribute::new(unsafe { op.context().to_ref() }, true).into(),
@@ -83,12 +83,8 @@ fn unswitch_loop<'c, 'a, 'd, 'q>(
                 .unwrap(),
         );
         let for_rets: Vec<Value<'_, '_>> = true_region.results().map(|r| r.into()).collect();
-        if_rewriter.insert(scf::r#yield(
-            &for_rets,
-            Location::unknown(&context),
-        ));
+        if_rewriter.insert(scf::r#yield(&for_rets, Location::unknown(&context)));
     }
-
 
     let ret_types = last_loop.results().map(|r| r.r#type());
     let ret_types: Vec<Type<'_>> = ret_types.collect();
@@ -122,9 +118,7 @@ fn scan_for_loops<'d, 'q, 'a, 'c>(
         current.walk(WalkOrder::PreOrder, |op| {
             let op_ident = op.name();
             let op_name = op_ident.as_string_ref().as_str().unwrap();
-            if (op_name == "scf.for" || op_name == "scf.while")
-                && !op.has_attribute("__visited")
-            {
+            if (op_name == "scf.for" || op_name == "scf.while") && !op.has_attribute("__visited") {
                 candidate_loops.push(unsafe { OperationRefMut::from_raw(op.to_raw()) });
                 return WalkResult::Skip;
             }
@@ -140,9 +134,9 @@ pub fn loop_unswitch(context: &Context, module: &mut Module<'_>) {
 
     while let Some(mut candidate_loop) = candidate_loops.pop() {
         let mut did_unswitch = false;
-        candidate_loop.clone().walk_mut(
-            WalkOrder::PreOrder,
-            |if_op: OperationRefMut<'_, '_>| {
+        candidate_loop
+            .clone()
+            .walk_mut(WalkOrder::PreOrder, |if_op: OperationRefMut<'_, '_>| {
                 let op_ident = if_op.name();
                 let op_name = op_ident.as_string_ref().as_str().unwrap();
                 if op_name != "scf.if" {
@@ -169,13 +163,9 @@ pub fn loop_unswitch(context: &Context, module: &mut Module<'_>) {
                 did_unswitch = true;
                 unswitch_loop(context, as_ref(candidate_loop), if_op, &mut candidate_loops);
                 WalkResult::Interrupt
-            },
-        );
+            });
         if !did_unswitch {
-            candidate_loop.set_attribute(
-                "__visited",
-                BoolAttribute::new(context, true).into(),
-            );
+            candidate_loop.set_attribute("__visited", BoolAttribute::new(context, true).into());
             for region in candidate_loop.regions() {
                 if let Some(block) = region.first_block() {
                     scan_for_loops(block, &mut candidate_loops);

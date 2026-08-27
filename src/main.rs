@@ -1,773 +1,438 @@
-use std::{env, error::Error, fmt::{self, Display, Formatter}, fs, io::{self, ErrorKind::QuotaExceeded}, os::raw::c_void, rc::Rc, thread::current, unreachable};
+use std::{assert_eq, collections::{HashMap, HashSet}, env, error::Error, ffi::c_void, fs, io};
 
 use melior::{
-    Context, dialect::DialectRegistry, ir::{
-        Block, BlockLike, BlockRef, Module, OperationRef, RegionLike, Value, ValueLike, attribute::IntegerAttribute, block::BlockArgument, operation::{OperationLike, OperationResult, WalkOrder, WalkResult},
+    Context, IrRewriter, dialect::DialectRegistry, ir::{
+        BlockLike, BlockRef, Module, OperationRef, Region, RegionLike, RegionRef, ShapedTypeLike, Type, TypeLike, Value, ValueLike, attribute::{BoolAttribute, DenseI64ArrayAttribute, FlatSymbolRefAttribute, IntegerAttribute, StringAttribute, TypeAttribute}, operation::OperationLike, r#type::{DimSize, FunctionType, IntegerType, MemRefType},
     }, utility::register_all_dialects,
 };
-use mlir_sys::MlirValue;
-use z3::{DeclKind::{self, Implies, *}, SatResult, Solver, ast::{self, Bool}};
-use z3::ast::Ast;
-use crate::{CapabilityType::{Shrd, Uniq}, Pattern::{Decreasing, Increasing, Poison}};
-
+mod capabilities;
 mod loop_unswitching;
+mod util;
+use capabilities::print_return_expressions;
+use wavelet_elab::{Expr, FnDef, Program, Stmt, Ty, TypedVar, UntypedVar, Val, ir::{ArrayLen, Signedness}};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CapabilityType {
-    Shrd,
-    Uniq,
+use crate::{capabilities::{Capability, to_wavelet_capability}, util::{BlockIter, FreshWaveletNames}};
+fn scf_to_wavelet<'c>(module: Module<'c>) -> Option<Program<UntypedVar>> {
+    todo!("ds");
+    None
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CapabilityOp {
-    Add,
-    Sub,
-    Mult,
-}
-
-#[derive(Debug, Clone)]
-enum CapabilityExpr<'c, 'a> {
-    BinOp {
-        operation: CapabilityOp,
-        operands: (Rc<CapabilityExpr<'c, 'a>>, Rc<CapabilityExpr<'c, 'a>>), //inclusive range
-    },
-    Constant(i64),
-    Variable(Value<'c, 'a>),
-    Blackbox(Value<'c, 'a>),
-}
-
-impl<'c, 'a> CapabilityExpr<'c, 'a> {
-    fn simplified(&self) -> CapabilityExpr<'c, 'a> {
-        if let Some(value) = self.constant_propagate() {
-            return CapabilityExpr::Constant(value);
-        }
-
-        let CapabilityExpr::BinOp {
-            operation,
-            operands,
-        } = self
-        else {
-            return self.clone();
-        };
-
-        let lhs = operands.0.simplified();
-        let rhs = operands.1.simplified();
-
-        if *operation == CapabilityOp::Add {
-            if let (
-                CapabilityExpr::BinOp {
-                    operation: CapabilityOp::Add,
-                    operands: lhs_operands,
-                },
-                CapabilityExpr::Constant(rhs_value),
-            ) = (&lhs, &rhs)
-            {
-                if let CapabilityExpr::Constant(lhs_value) = lhs_operands.1.as_ref() {
-                    if let Some(value) = lhs_value.checked_add(*rhs_value) {
-                        return CapabilityExpr::BinOp {
-                            operation: CapabilityOp::Add,
-                            operands: (
-                                Rc::clone(&lhs_operands.0),
-                                Rc::new(CapabilityExpr::Constant(value)),
-                            ),
-                        };
-                    }
-                }
-            }
-        }
-
-        match (operation, &lhs, &rhs) {
-            (CapabilityOp::Add, _, CapabilityExpr::Constant(0))
-            | (CapabilityOp::Sub, _, CapabilityExpr::Constant(0))
-            | (CapabilityOp::Mult, _, CapabilityExpr::Constant(1)) => lhs,
-            (CapabilityOp::Add, CapabilityExpr::Constant(0), _)
-            | (CapabilityOp::Mult, CapabilityExpr::Constant(1), _) => rhs,
-            (CapabilityOp::Mult, _, CapabilityExpr::Constant(0))
-            | (CapabilityOp::Mult, CapabilityExpr::Constant(0), _) => {
-                CapabilityExpr::Constant(0)
-            }
-            _ => CapabilityExpr::BinOp {
-                operation: *operation,
-                operands: (Rc::new(lhs), Rc::new(rhs)),
-            },
-        }
-    }
-
-    fn precedence(&self) -> u8 {
-        match self {
-            CapabilityExpr::BinOp {
-                operation: CapabilityOp::Add | CapabilityOp::Sub,
-                ..
-            } => 1,
-            CapabilityExpr::BinOp {
-                operation: CapabilityOp::Mult,
-                ..
-            } => 2,
-            CapabilityExpr::Constant(_)
-            | CapabilityExpr::Variable(_)
-            | CapabilityExpr::Blackbox(_) => 3,
-        }
-    }
-
-    fn fmt_compact(&self, formatter: &mut Formatter<'_>, minimum_precedence: u8) -> fmt::Result {
-        let precedence = self.precedence();
-        let parenthesize = precedence < minimum_precedence;
-        if parenthesize {
-            write!(formatter, "(")?;
-        }
-
-        match self {
-            CapabilityExpr::BinOp {
-                operation,
-                operands,
-            } => {
-                operands.0.fmt_compact(formatter, precedence)?;
-                let symbol = match operation {
-                    CapabilityOp::Add => "+",
-                    CapabilityOp::Sub => "-",
-                    CapabilityOp::Mult => "*",
-                };
-                write!(formatter, " {symbol} ")?;
-                let rhs_precedence = if *operation == CapabilityOp::Sub {
-                    precedence + 1
-                } else {
-                    precedence
-                };
-                operands.1.fmt_compact(formatter, rhs_precedence)?;
-            }
-            CapabilityExpr::Constant(value) => write!(formatter, "{value}")?,
-            CapabilityExpr::Variable(_) => write!(formatter, "i")?,
-            CapabilityExpr::Blackbox(value) => write!(formatter, "{}", compact_value_name(*value))?,
-        }
-
-        if parenthesize {
-            write!(formatter, ")")?;
-        }
-        Ok(())
-    }
-
-    fn substitute_variable(
-        &self,
-        variable_replacement: &CapabilityExpr<'c, 'a>,
-    ) -> CapabilityExpr<'c, 'a> {
-        match self {
-            CapabilityExpr::BinOp {
-                operation,
-                operands,
-            } => CapabilityExpr::BinOp {
-                operation: *operation,
-                operands: (
-                    Rc::new(operands.0.substitute_variable(variable_replacement)),
-                    Rc::new(operands.1.substitute_variable(variable_replacement)),
-                ),
-            },
-            CapabilityExpr::Variable(_) => variable_replacement.clone(),
-            CapabilityExpr::Constant(_) | CapabilityExpr::Blackbox(_) => self.clone(),
-        }
-    }
-
-    fn expand_blackboxes(
-        &self,
-        parent_for_loop: Option<OperationRef<'c, 'a>>,
-    ) -> Option<CapabilityExpr<'c, 'a>> {
-        match self {
-            CapabilityExpr::BinOp {
-                operation,
-                operands,
-            } => Some(CapabilityExpr::BinOp {
-                operation: *operation,
-                operands: (
-                    Rc::new(operands.0.expand_blackboxes(parent_for_loop)?),
-                    Rc::new(operands.1.expand_blackboxes(parent_for_loop)?),
-                ),
-            }),
-            CapabilityExpr::Blackbox(value) => match parent_for_loop {
-                Some(for_loop) => generate_expr(*value, Some(for_loop)),
-                None => Some(self.clone()),
-            },
-            CapabilityExpr::Constant(_) | CapabilityExpr::Variable(_) => Some(self.clone()),
-        }
-    }
-
-    fn promote(
-        &self,
-        variable_replacement: &CapabilityExpr<'c, 'a>,
-        parent_for_loop: Option<OperationRef<'c, 'a>>,
-    ) -> Option<CapabilityExpr<'c, 'a>> {
-        self.substitute_variable(variable_replacement)
-            .expand_blackboxes(parent_for_loop)
-    }
-
-    fn constant_propagate(&self) -> Option<i64> {
-        match self {
-            CapabilityExpr::BinOp {
-                operation,
-                operands,
-            } => {
-                let lhs = operands.0.constant_propagate()?;
-                let rhs = operands.1.constant_propagate()?;
-
-                match operation {
-                    CapabilityOp::Add => lhs.checked_add(rhs),
-                    CapabilityOp::Sub => lhs.checked_sub(rhs),
-                    CapabilityOp::Mult => lhs.checked_mul(rhs),
-                }
-            }
-            CapabilityExpr::Constant(value) => Some(*value),
-            CapabilityExpr::Variable(_) | CapabilityExpr::Blackbox(_) => None,
-        }
-    }
-
-    fn to_z3(
-        &self,
-        iteration_variable: &ast::Int,
-        for_loop_end: &ast::Int,
-        for_loop_end_value: &Value<'_, '_>,
-    ) -> ast::Int {
-        match self {
-            CapabilityExpr::BinOp {
-                operation,
-                operands,
-            } => {
-                let lhs = operands.0.to_z3(
-                    iteration_variable,
-                    for_loop_end,
-                    for_loop_end_value,
-                );
-                let rhs = operands.1.to_z3(
-                    iteration_variable,
-                    for_loop_end,
-                    for_loop_end_value,
-                );
-
-                match operation {
-                    CapabilityOp::Add => ast::Int::add(&[&lhs, &rhs]),
-                    CapabilityOp::Sub => ast::Int::sub(&[&lhs, &rhs]),
-                    CapabilityOp::Mult => ast::Int::mul(&[&lhs, &rhs]),
-                }
-            }
-            CapabilityExpr::Constant(value) => ast::Int::from_i64(*value),
-            CapabilityExpr::Variable(_) => iteration_variable.clone(),
-            CapabilityExpr::Blackbox(value)
-                if value.to_raw().ptr == for_loop_end_value.to_raw().ptr =>
-            {
-                for_loop_end.clone()
-            }
-            CapabilityExpr::Blackbox(value) => {
-                let name = format!("blackbox_{:x}", value.to_raw().ptr as usize);
-                ast::Int::new_const(name)
-            }
-        }
-    }
-}
-
-impl Display for CapabilityExpr<'_, '_> {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        self.simplified().fmt_compact(formatter, 0)
-    }
-}
-
-fn compact_value_name(value: Value<'_, '_>) -> String {
-    if let Ok(argument) = BlockArgument::try_from(value) {
-        return format!("arg{}", argument.argument_number());
-    }
-
-    let printed = value.to_string();
-    printed
-        .split_once(" = ")
-        .map_or(printed.as_str(), |(name, _)| name)
-        .trim()
-        .to_string()
-}
-
-
-#[derive(Debug, Clone)]
-struct Capability<'c, 'a> {
-    array: Value<'c,'a>,
-    capability_type: CapabilityType,
-    capability_expr: Option<(CapabilityExpr<'c, 'a>,CapabilityExpr<'c, 'a>)>, // None means "poison" which takes the entire bounds of the array
-}
-
-impl Display for Capability<'_, '_> {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        let kind = match self.capability_type {
-            CapabilityType::Shrd => "shrd",
-            CapabilityType::Uniq => "uniq",
-        };
-        let array = compact_value_name(self.array);
-        match &self.capability_expr {
-            Some((start, end)) => write!(formatter, "{array}: {kind} @ {start}..{end}"),
-            None => write!(formatter, "{array}: {kind} @ *"),
-        }
-    }
-}
-
-fn format_capabilities(capabilities: &[Capability<'_, '_>]) -> String {
-    capabilities
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-fn has_iteration_variable(expr: &CapabilityExpr<'_, '_>) -> bool {
-    match expr {
-        CapabilityExpr::BinOp { operands, .. } => {
-            has_iteration_variable(&operands.0) || has_iteration_variable(&operands.1)
-        }
-        CapabilityExpr::Variable(_) => true,
-        CapabilityExpr::Constant(_) | CapabilityExpr::Blackbox(_) => false,
-    }
-}
-
-fn find_parent_for<'c, 'a>(operation: OperationRef<'c, 'a>) -> Option<OperationRef<'c, 'a>> {
-    let mut parent = operation.block()?.parent_operation()?;
-
-    loop {
-        let ident = parent.name();
-        let name = ident.as_string_ref().as_str().ok()?;
-
-        if name == "scf.for" {
-            return Some(parent);
-        }
-
-        parent = parent.block()?.parent_operation()?;
-    }
-}
-
-fn find_parent_iterator<'c, 'a>(operation: OperationRef<'c, 'a>) -> Option<Value<'c, 'a>> {
-    let parent_for = find_parent_for(operation)?;
-    let body = parent_for.first_region()?.first_block()?;
-    Some(body.argument(0).ok()?.into())
-}
-
-fn block_is_inside_operation(
-    block: BlockRef<'_, '_>,
-    ancestor: OperationRef<'_, '_>,
-) -> bool {
-    let mut parent = block.parent_operation();
-
-    while let Some(operation) = parent {
-        if operation.to_raw().ptr == ancestor.to_raw().ptr {
-            return true;
-        }
-        parent = operation.block().and_then(|block| block.parent_operation());
-    }
-
-    false
-}
-// The purpose of this is to determine what a specific operation will actually require when it is used
-// I need to create a function called generate_local_expr, which will actually decide the emitted capabilities, which views anything outside as a blackbox
-
-// Pass in a value and the scf.for whose capabilities are being analyzed.
-// If the value is defined outside the target loop and can be reduced to a constant,
-// return a Constant. Otherwise, return a Blackbox without expanding it.
-// If the value is defined inside the target loop by a supported arithmetic operation,
-// recurse on its operands. If that operation is unsupported, return None.
-// If the value is a block argument defined by the target loop and is its induction
-// variable, return a Variable. Any other block argument defined inside the target
-// loop returns None.
-// Any None returned during recursion poisons the whole expression.
-fn generate_expr<'c, 'a>(
-    value: Value<'c, 'a>,
-    target_for_loop: Option<OperationRef<'c, 'a>>,
-) -> Option<CapabilityExpr<'c, 'a>>
-where
-    'c: 'a,
-{
-    generate_expr_helper(value, target_for_loop)
-}
-
-fn constant_fold_value(value: Value<'_, '_>) -> Option<i64> {
-    let operation = OperationResult::try_from(value).ok()?.owner();
-    let ident = operation.name();
-    let name = ident.as_string_ref().as_str().ok()?;
-
+const generator: FreshWaveletNames = FreshWaveletNames::new();
+fn operation_to_wavelet<'c, 'a>(
+    operation: OperationRef<'c, 'a>,
+    name: &str,
+) -> Option<Stmt<UntypedVar>> {
     if name == "arith.constant" {
-        let attr = operation.attribute("value").ok()?;
-        return Some(IntegerAttribute::try_from(attr).ok()?.value());
+        return constant_to_wavelet(operation);
     }
 
-    let lhs = constant_fold_value(operation.operand(0).ok()?)?;
-    let rhs = constant_fold_value(operation.operand(1).ok()?)?;
-    match name {
-        "arith.addi" => lhs.checked_add(rhs),
-        "arith.subi" => lhs.checked_sub(rhs),
-        "arith.muli" => lhs.checked_mul(rhs),
+    if name == "memref.load" {
+        let operands: Vec<_> = operation.operands().collect();
+        if operands.len() != 2 {
+            return None;
+        }
+        let array = UntypedVar(value_to_name(&operands[0]));
+        let index = UntypedVar(value_to_name(&operands[1]));
+        let len = wavelet_array_len(&operands[0])?;
+        let result: Value<'_, '_> = operation.result(0).ok()?.into();
+
+        return Some(Stmt::LetOp {
+            vars: vec![UntypedVar(value_to_name(&result))],
+            op: wavelet_elab::Op::Load { array, index, len },
+            fence: false,
+        });
+    }
+
+    if name == "memref.store" {
+        let operands: Vec<_> = operation.operands().collect();
+        if operands.len() != 3 {
+            return None;
+        }
+        let value = UntypedVar(value_to_name(&operands[0]));
+        let array = UntypedVar(value_to_name(&operands[1]));
+        let index = UntypedVar(value_to_name(&operands[2]));
+        let len = wavelet_array_len(&operands[1])?;
+
+        return Some(Stmt::LetOp {
+            vars: vec![],
+            op: wavelet_elab::Op::Store {
+                array,
+                index,
+                value,
+                len,
+            },
+            fence: false,
+        });
+    }
+
+    if name == "func.call" {
+        let callee = FlatSymbolRefAttribute::try_from(
+            operation
+                .attribute("callee")
+                .expect("func.call must have a callee attribute"),
+        )
+        .expect("func.call callee must be a flat symbol reference");
+        let mut scalar_args = Vec::new();
+        let mut array_args = Vec::new();
+        for operand in operation.operands() {
+            let argument = UntypedVar(value_to_name(&operand));
+            match value_to_wavelet_ty(&operand) {
+                Ty::RefShrd { .. } | Ty::RefUniq { .. } => array_args.push(argument),
+                _ => scalar_args.push(argument),
+            }
+        }
+        scalar_args.extend(array_args);
+
+        assert!(
+            operation.result_count() <= 1,
+            "Wavelet does not support calls with multiple results"
+        );
+        let result = match operation.result(0) {
+            Ok(result) => UntypedVar(value_to_name(&result.into())),
+            Err(_) => UntypedVar(generator.fresh("_call_result")),
+        };
+
+        return Some(Stmt::LetCall {
+            vars: vec![result],
+            func: wavelet_elab::FnName(callee.value().to_string()),
+            args: scalar_args,
+            fence: false,
+        });
+    }
+
+    let operands: Vec<_> = operation.operands().collect();
+    if operands.len() != 2 {
+        return None;
+    }
+    let binop = match name {
+        "arith.addi" => Some((wavelet_elab::Op::<UntypedVar>::Add, false)),
+        "arith.subi" => Some((wavelet_elab::Op::Sub, false)),
+        "arith.muli" => Some((wavelet_elab::Op::Mul, false)),
+        "arith.divsi" => Some((wavelet_elab::Op::Sdiv, false)),
+        "arith.divui" => Some((wavelet_elab::Op::Udiv, false)),
+        "arith.andi" if value_to_wavelet_ty(&operands[0]) == Ty::Bool => {
+            Some((wavelet_elab::Op::And, false))
+        }
+        "arith.andi" => Some((wavelet_elab::Op::BitAnd, false)),
+        "arith.ori" if value_to_wavelet_ty(&operands[0]) == Ty::Bool => {
+            Some((wavelet_elab::Op::Or, false))
+        }
+        "arith.ori" => Some((wavelet_elab::Op::BitOr, false)),
+        "arith.xori" if value_to_wavelet_ty(&operands[0]) == Ty::Bool => {
+            Some((wavelet_elab::Op::NotEqual, false))
+        }
+        "arith.xori" => Some((wavelet_elab::Op::BitXor, false)),
+        "arith.shli" => Some((wavelet_elab::Op::Shl, false)),
+        "arith.shrsi" => Some((wavelet_elab::Op::Ashr, false)),
+        "arith.shrui" => Some((wavelet_elab::Op::Lshr, false)),
+        "arith.cmpi" => {
+            let predicate = operation
+                .attribute("predicate")
+                .ok()
+                .and_then(|attribute| IntegerAttribute::try_from(attribute).ok())
+                .map(|attribute| attribute.value());
+            match predicate {
+                Some(0) => Some((wavelet_elab::Op::Equal, false)),
+                Some(1) => Some((wavelet_elab::Op::NotEqual, false)),
+                Some(2) => Some((wavelet_elab::Op::SignedLessThan, false)),
+                Some(3) => Some((wavelet_elab::Op::SignedLessEqual, false)),
+                Some(4) => Some((wavelet_elab::Op::SignedLessThan, true)),
+                Some(5) => Some((wavelet_elab::Op::SignedLessEqual, true)),
+                Some(6) => Some((wavelet_elab::Op::UnsignedLessThan, false)),
+                Some(7) => Some((wavelet_elab::Op::UnsignedLessEqual, false)),
+                Some(8) => Some((wavelet_elab::Op::UnsignedLessThan, true)),
+                Some(9) => Some((wavelet_elab::Op::UnsignedLessEqual, true)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }?;
+
+    let (op, reverse_operands) = binop;
+    let mut vars: Vec<_> = operands
+        .iter()
+        .map(|operand| UntypedVar(value_to_name(operand)))
+        .collect();
+    if reverse_operands {
+        vars.swap(0, 1);
+    }
+    vars.push(UntypedVar(value_to_name(
+        &operation.result(0).ok()?.into(),
+    )));
+
+    Some(Stmt::LetOp {
+        vars,
+        op,
+        fence: false,
+    })
+}
+
+fn constant_to_wavelet(operation: OperationRef<'_, '_>) -> Option<Stmt<UntypedVar>> {
+    let result = operation.result(0).ok()?;
+    let attribute = operation.attribute("value").ok()?;
+    let val = if value_to_wavelet_ty(&result.into()) == Ty::Bool {
+        if let Ok(attribute) = BoolAttribute::try_from(attribute) {
+            Val::Bool(attribute.value())
+        } else {
+            Val::Bool(IntegerAttribute::try_from(attribute).ok()?.value() != 0)
+        }
+    } else {
+        Val::Int(IntegerAttribute::try_from(attribute).ok()?.value())
+    };
+
+    Some(Stmt::LetVal {
+        var: UntypedVar(value_to_name(&result.into())),
+        val,
+        fence: false,
+    })
+}
+
+fn value_to_wavelet_ty(value: &Value<'_, '_>) -> Ty {
+    mlir_type_to_wavelet_ty(value.r#type())
+}
+
+fn wavelet_array_len(value: &Value<'_, '_>) -> Option<ArrayLen> {
+    match value_to_wavelet_ty(value) {
+        Ty::RefShrd { len, .. } | Ty::RefUniq { len, .. } => Some(len),
         _ => None,
     }
 }
 
-fn generate_expr_helper<'c, 'a>(
-    value: Value<'c, 'a>,
-    target_for_loop: Option<OperationRef<'c, 'a>>,
-) -> Option<CapabilityExpr<'c, 'a>>
-where
-    'c: 'a,
-{
-    if let Ok(argument) = BlockArgument::try_from(value) {
-        let owner = argument.owner();
-
-        if let Some(for_loop) = target_for_loop {
-            let loop_body = for_loop.first_region()?.first_block()?;
-            let iterator: Value<'c, 'a> = loop_body.argument(0).ok()?.into();
-
-            if iterator.to_raw().ptr == value.to_raw().ptr {
-                return Some(CapabilityExpr::Variable(value));
-            }
-
-            if block_is_inside_operation(owner, for_loop) {
-                return None;
-            }
-        }
-
-        return Some(CapabilityExpr::Blackbox(value));
-    }
-    let operation = OperationResult::try_from(value).ok()?;
-    let operation = operation.owner();
-
-    let is_defined_inside_target = target_for_loop.is_some_and(|for_loop| {
-        operation
-            .block()
-            .is_some_and(|block| block_is_inside_operation(block, for_loop))
-    });
-
-    if !is_defined_inside_target {
-        return Some(match constant_fold_value(value) {
-            Some(value) => CapabilityExpr::Constant(value),
-            None => CapabilityExpr::Blackbox(value),
-        });
+fn mlir_type_to_wavelet_ty(r#type: Type<'_>) -> Ty {
+    if r#type.is_index() {
+        return Ty::Int(Signedness::Signed);
     }
 
-    let ident = operation.name();
-    let name = ident.as_string_ref().as_str().unwrap();
-    let binop = match name {
-        "arith.constant" => {
-            let attr = operation.attribute("value").ok()?;
-            let value = IntegerAttribute::try_from(attr).ok()?.value();
-            return Some(CapabilityExpr::Constant(value));
-        }
-        "arith.addi" => CapabilityOp::Add,
-        "arith.subi" => CapabilityOp::Sub,
-        "arith.muli" => CapabilityOp::Mult,
-        _ => return None,
-    };
-    let operands = (
-        Rc::new(generate_expr_helper(
-            operation.operand(0).unwrap(),
-            target_for_loop,
-        )?),
-        Rc::new(generate_expr_helper(
-            operation.operand(1).unwrap(),
-            target_for_loop,
-        )?),
+    if let Ok(integer_type) = IntegerType::try_from(r#type) {
+        return if integer_type.width() == 1 {
+            Ty::Bool
+        } else if integer_type.is_unsigned() {
+            Ty::Int(Signedness::Unsigned)
+        } else {
+            Ty::Int(Signedness::Signed)
+        };
+    }
+
+    let memref_type = MemRefType::try_from(r#type)
+        .unwrap_or_else(|_| panic!("unsupported MLIR type for Wavelet: {type}", type = r#type));
+    assert_eq!(
+        memref_type.rank(),
+        1,
+        "Wavelet only supports one-dimensional arrays"
     );
-    Some(CapabilityExpr::BinOp {
-        operation: binop,
-        operands,
-    })
+    let elem = mlir_type_to_wavelet_ty(memref_type.element());
+    let len = match memref_type.dim_size(0).expect("memref dimension must exist") {
+        DimSize::Static(size) => usize::try_from(size).expect("array length must fit in usize"),
+        DimSize::Dynamic => panic!("Wavelet does not support dynamically sized arrays"),
+    };
+
+    Ty::RefUniq {
+        elem: Box::new(elem),
+        len: ArrayLen::Const(len),
+    }
 }
 
-fn print_return_expressions(module: &Module<'_>) {
-    module
-        .as_operation()
-        .walk(WalkOrder::PreOrder, |operation| {
-            let ident = operation.name();
-            let name = ident.as_string_ref().as_str().unwrap();
-
-            if name == "func.return" {
-                let target_for_loop = find_parent_for(operation);
-                for value in operation.operands() {
-                    if let Some(expression) = generate_expr(value, target_for_loop) {
-                        println!("{expression}");
+fn value_to_name(value: &Value<'_, '_>) -> String {
+    let t= format!("v{:p}",value.to_raw().ptr);
+    t
+}
+fn for_loop_to_function_name(for_loop: &OperationRef<'_, '_>) -> String{
+    let t= format!("f{:p}",for_loop.to_raw().ptr);
+    t
+} 
+fn find_free_variables<'c, 'a>(block: BlockRef<'c, 'a>) -> Vec<Value<'c, 'a>> {
+    fn collect_definitions<'c, 'a>(
+        block: BlockRef<'c, 'a>,
+        definitions: &mut HashSet<*const c_void>,
+    ) {
+        for operation in BlockIter::new(block) {
+            for result in operation.results() {
+                definitions.insert(result.to_raw().ptr);
+            }
+            for region in operation.regions() {
+                let mut nested_block = region.first_block();
+                while let Some(current) = nested_block {
+                    for index in 0..current.argument_count() {
+                        definitions.insert(current.argument(index).unwrap().to_raw().ptr);
                     }
+                    collect_definitions(current, definitions);
+                    nested_block = current.next_in_region();
                 }
             }
-
-            WalkResult::Advance
-        });
-}
-fn push_capability<'c, 'a>(
-    capabilities: &mut Vec<Capability<'c, 'a>>,
-    capability: Capability<'c, 'a>,
-) -> bool {
-    let array = capability.array.to_raw().ptr;
-    let is_poisoned = capability.capability_expr.is_none();
-
-    if capabilities.iter().any(|existing| {
-        existing.array.to_raw().ptr == array
-            && existing.capability_expr.is_none()
-            && existing.capability_type == Uniq
-    }) {
-        return false;
+        }
     }
 
-    if is_poisoned && capability.capability_type == Uniq {
-        capabilities.retain(|existing| existing.array.to_raw().ptr != array);
-        capabilities.push(capability);
-        return true;
+    fn collect_uses<'c, 'a>(
+        block: BlockRef<'c, 'a>,
+        definitions: &HashSet<*const c_void>,
+        seen: &mut HashSet<*const c_void>,
+        free_variables: &mut Vec<Value<'c, 'a>>,
+    ) {
+        for operation in BlockIter::new(block) {
+            for operand in operation.operands() {
+                let value = operand.to_raw().ptr;
+                if !definitions.contains(&value) && seen.insert(value) {
+                    free_variables.push(operand);
+                }
+            }
+            for region in operation.regions() {
+                let mut nested_block = region.first_block();
+                while let Some(current) = nested_block {
+                    collect_uses(current, definitions, seen, free_variables);
+                    nested_block = current.next_in_region();
+                }
+            }
+        }
     }
 
-    if capability.capability_type == Shrd
-        && capabilities.iter().any(|existing| {
-            existing.array.to_raw().ptr == array
-                && existing.capability_expr.is_none()
-                && existing.capability_type == Shrd
-        })
-    {
-        return false;
-    }
+    let mut definitions = HashSet::new();
+    collect_definitions(block, &mut definitions);
 
-    if is_poisoned && capability.capability_type == Shrd {
-        capabilities.retain(|existing| {
-            existing.array.to_raw().ptr != array || existing.capability_type == Uniq
-        });
-    }
-
-    capabilities.push(capability);
-    true
-}
-
-// This function assumes there are no if,while, etc...
-// For now, we assume that the array types are flat. Later we will add multidimensional array features
-fn block_capabilities<'c, 'a,'b>(block: BlockRef<'c,'a>, capabilities: &mut Vec<Capability<'c,'a>>)
-where 'c: 'a
-{
-    println!(
-        "[block_capabilities] enter block with {} propagated capabilities",
-        capabilities.len()
+    let mut free_variables = Vec::new();
+    collect_uses(
+        block,
+        &definitions,
+        &mut HashSet::new(),
+        &mut free_variables,
     );
-    let mut current_opt = block.first_operation();
+    free_variables
+}
 
-    while let Some(current) = current_opt {
-        let ident = current.name();
+fn function_to_wavelet<'c, 'a>(func: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, func_map: HashMap<* mut c_void, Vec<Capability<'c, 'a>>>){
+    let block = func.region(0).unwrap().first_block().unwrap();
+    let alias_information = block.first_operation();
+    let mut arguments = Vec::new();
+    let mut alloc_arrays = Vec::new();
+
+    for argument_index in 0..block.argument_count() {
+        let value: Value<'_, '_> = block.argument(argument_index).unwrap().into();
+        if MemRefType::try_from(value.r#type()).is_ok() {
+            continue;
+        }
+        arguments.push(TypedVar {
+            name: value_to_name(&value),
+            ty: value_to_wavelet_ty(&value),
+        });
+    }
+
+    if let Some(first_line) = alias_information{
+        let ident = first_line.name();
+        let opname = ident.as_string_ref().as_str().unwrap();
+        if opname == "memref.distinct_objects"{
+            let alloc_array_indices = first_line
+                .attribute("alloc_arrays")
+                .ok()
+                .map(|attribute| {
+                    DenseI64ArrayAttribute::try_from(attribute)
+                        .expect("alloc_arrays must be an array<i64> attribute")
+                });
+
+            for (result_index, arr) in first_line.results().enumerate(){
+                let value = arr.into();
+                let name = value_to_name(&value);
+
+                if alloc_array_indices.is_some_and(|indices| {
+                    (0..indices.len()).any(|index| {
+                        indices.element(index).unwrap() == result_index as i64
+                    })
+                }) {
+                    alloc_arrays.push(name.clone());
+                }
+
+                arguments.push(TypedVar {
+                    name,
+                    ty: value_to_wavelet_ty(&value),
+                });
+            }
+        }
+    }
+    let name = StringAttribute::try_from(func.attribute("sym_name").unwrap()).unwrap();
+    let caps = func_map.get(&func.to_raw().ptr).unwrap();
+    let caps = to_wavelet_capability(caps);
+
+    let type_attribute =
+      TypeAttribute::try_from(func.attribute("function_type").unwrap()).unwrap();
+    let function_type  = FunctionType::try_from(type_attribute.value()).unwrap();
+    if function_type.result_count() > 1{
+        panic!("does not support functions with multiple return types")
+    }
+    let returns  = function_type.result(0)
+        .map_or(Ty::Unit, |t| mlir_type_to_wavelet_ty(t));
+
+    let body = block_to_wavelet(block, program);
+    let wavelet_func = wavelet_elab::FnDef{
+        name: wavelet_elab::FnName(name.to_string()), 
+        params: arguments, 
+        alloc_arrays,
+        caps, 
+        returns, 
+        body
+    };
+    program.add_fn(wavelet_func);
+}
+fn value_to_typed_var(value: &Value<'_, '_>) -> TypedVar{
+    TypedVar { 
+        name: value_to_name(value), 
+        ty: value_to_wavelet_ty(value) 
+    }
+}
+fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, cap_map: HashMap<* mut c_void, Vec<Capability<'c, 'a>>>) ->  Expr<UntypedVar>{
+    let block = for_loop
+        .first_region()
+        .unwrap()
+        .first_block()
+        .unwrap();
+    
+    let params: Vec<TypedVar> = find_free_variables(block).iter().map(value_to_typed_var).collect();
+    let func: FnDef<UntypedVar> = FnDef{
+        name: wavelet_elab::FnName(for_loop_to_function_name(&for_loop)),
+        params,
+        alloc_arrays: Vec::new(),
+        caps: todo!(),
+        returns: todo!(),
+        body: todo!(),
+    };
+    program.add_fn(func);
+    todo!()
+}
+fn block_to_wavelet<'c, 'a>(block: BlockRef<'c, 'a>, program: &mut Program<UntypedVar>) -> wavelet_elab::Expr<UntypedVar>{
+    let mut stmts = Vec::new();
+    let mut tail = None;
+    for operation in BlockIter::new(block) {
+        let ident = operation.name();
         let name = ident.as_string_ref().as_str().unwrap();
-        println!("[block_capabilities] visiting {name}");
-        if name == "memref.load" {
-            let array = current.operand(0).unwrap();
-
-            let idx = current.operand(1).unwrap();
-            let capability_expr = generate_expr(idx, find_parent_for(current));
-            if push_capability(capabilities, Capability
-                { array,
-                    capability_type: Shrd,
-                    capability_expr: capability_expr.map(|x| (x.clone(),x))
-
+        if name == "func.return"{
+            let returned = match operation.operand(0) {
+                Ok(value) => UntypedVar(value_to_name(&value)),
+                Err(_) => {
+                    let unit = UntypedVar("_unit_ret".to_string());
+                    stmts.push(Stmt::LetVal {
+                        var: unit.clone(),
+                        val: Val::Unit,
+                        fence: false,
+                    });
+                    unit
                 }
-                ) {
-                println!(
-                    "[block_capabilities] added load capability: {}",
-                    capabilities.last().unwrap()
-                );
-            } else {
-                println!("[block_capabilities] load capability already covered");
+            };
+            tail = Some(wavelet_elab::Tail::RetVar(returned));
+            break;
+        }else if operation.region_count() == 0 {
+            let wavelet_op = operation_to_wavelet(operation, name);
+            if wavelet_op.is_none(){
+                continue
             }
+            stmts.push(wavelet_op.unwrap());
 
-        } else if name == "memref.store" {
-            let array = current.operand(1).unwrap();
-            let idx = current.operand(2).unwrap();
-            let capability_expr = generate_expr(idx, find_parent_for(current));
-            if push_capability(capabilities, Capability
-                    { array, capability_type: Uniq, capability_expr: capability_expr.map(|x| (x.clone(),x))}
-                ) {
-                println!(
-                    "[block_capabilities] added store capability: {}",
-                    capabilities.last().unwrap()
-                );
-            } else {
-                println!("[block_capabilities] store capability already covered");
-            }
-        
-
-        }else if name == "scf.if"{
-            println!("[block_capabilities] descending into scf.if");
-            for region in current.regions(){
-                if let Some(sub_block) = region.first_block(){
-                    block_capabilities(sub_block, capabilities);
-                }
-            }
         }else if name == "scf.for"{
-            println!("[block_capabilities] collecting inner scf.for capabilities");
-            let inner_block = current.first_region().unwrap().first_block().unwrap();
-            let mut inner_capabilities = vec![];
-            block_capabilities(inner_block, &mut inner_capabilities);
-            println!(
-                "[block_capabilities] scf.for produced {} inner capabilities",
-                inner_capabilities.len()
-            );
-            let lower_bound_var = current.operand(0).unwrap();
-            let upper_bound_var = current.operand(1).unwrap();
             
-            let step_var = current.operand(2).unwrap();
-            let lower_bound = generate_expr(lower_bound_var, Some(current)).map(Rc::new);
-            let upper_bound = generate_expr(upper_bound_var, Some(current)).map(Rc::new);
-
-            let parent_for_loop = find_parent_for(current);
-
-            let is_range_poisoned = lower_bound.is_none() || upper_bound.is_none();
-
-            let step = generate_expr(step_var, Some(current))
-                .and_then(|step| step.constant_propagate());
-            // We only get benefits if step is actually a constants. THis is needed for when we do code generaiton but not relevant here
-
-            for capability in inner_capabilities{
-                let Capability {
-                    array,
-                    capability_type,
-                    capability_expr,
-                } = capability;
-
-                match capability_expr {
-                    Some((start, end))
-                        if has_iteration_variable(&start) || has_iteration_variable(&end) =>
-                    {
-                        if is_range_poisoned {
-                            let inserted = push_capability(capabilities, Capability {
-                                array,
-                                capability_type,
-                                capability_expr: None,
-                            });
-                            println!(
-                                "[block_capabilities] poisoned loop capability because a loop bound is unknown; inserted={inserted}"
-                            );
-                            continue;
-                        }
-
-                        let pattern =
-                            z3_for_loop_viability(&start, &end, &upper_bound_var);
-                        println!("[block_capabilities] loop access pattern: {pattern:?}");
-
-                        let inserted = push_capability(capabilities, pattern_to_capabilities(
-                            array,
-                            capability_type,
-                            start,
-                            end,
-                            Rc::clone(lower_bound.as_ref().unwrap()),
-                            Rc::clone(upper_bound.as_ref().unwrap()),
-                            pattern,
-                            parent_for_loop,
-                        ));
-                        if inserted {
-                            println!(
-                                "[block_capabilities] promoted loop capability: {}",
-                                capabilities.last().unwrap()
-                            );
-                        } else {
-                            println!("[block_capabilities] promoted loop capability already covered");
-                        }
-                    }
-                    capability_expr => {
-                        let inserted = push_capability(capabilities, Capability {
-                            array,
-                            capability_type,
-                            capability_expr,
-                        });
-                        if inserted {
-                            println!(
-                                "[block_capabilities] propagated unchanged capability: {}",
-                                capabilities.last().unwrap()
-                            );
-                        } else {
-                            println!("[block_capabilities] unchanged capability already covered");
-                        }
-                    }
-                }
-            }
         }
-        current_opt = current.next_in_block();
     }
-
-    println!(
-        "[block_capabilities] exit block with {} propagated capabilities: [{}]",
-        capabilities.len(),
-        format_capabilities(capabilities)
-    );
-}
-#[derive(Debug, Clone, Copy,PartialEq, Eq)]
-enum Pattern{
-    Increasing,
-    Decreasing,
-    Poison
-}
-fn pattern_to_capabilities<'c, 'a>(
-    array: Value<'c, 'a>,
-    capability_type: CapabilityType,
-    x: CapabilityExpr<'c, 'a>,
-    y: CapabilityExpr<'c, 'a>,
-    lower_bound: Rc<CapabilityExpr<'c, 'a>>,
-    upper_bound_exclusive: Rc<CapabilityExpr<'c, 'a>>,
-    pattern: Pattern,
-    parent_for_loop: Option<OperationRef<'c, 'a>>
-) -> Capability<'c, 'a>{
-    let upper_bound = Rc::new(CapabilityExpr::BinOp {
-        operation: CapabilityOp::Sub,
-        operands: (
-            upper_bound_exclusive,
-            Rc::new(CapabilityExpr::Constant(1)),
-        ),
-    });
-    let capability_expr = match pattern{
-        Increasing => {
-            let x = x.promote(lower_bound.as_ref(), parent_for_loop);
-            let y = y.promote(upper_bound.as_ref(), parent_for_loop);
-            x.zip(y)
-        },
-        Decreasing =>{
-            let x = x.promote(upper_bound.as_ref(), parent_for_loop);
-            let y = y.promote(lower_bound.as_ref(), parent_for_loop);
-            x.zip(y)
-        },
-        Poison => {
-            None
-        }
-    };
-    Capability {
-        array,
-        capability_type,
-        capability_expr
-    }
-
-}
-fn z3_for_loop_viability<'c,'a>(
-    start: &CapabilityExpr<'c, 'a>,
-    end: &CapabilityExpr<'c, 'a>,
-    for_loop_end_value: &Value<'c, 'a>,
-) -> Pattern{
-
-    let inner_iter_var = ast::Int::new_const("i");
-    let next_iter_var = ast::Int::add(&[&inner_iter_var, &ast::Int::from_i64(1)]);
-    let for_loop_end = ast::Int::new_const("end");
-    let x = start.to_z3(&inner_iter_var, &for_loop_end, for_loop_end_value);
-    let y = end.to_z3(&inner_iter_var, &for_loop_end, for_loop_end_value);
     
-    let x_1 = x.substitute(&[(&inner_iter_var, &next_iter_var)]);
-    let y_1 = y.substitute(&[(&inner_iter_var, &next_iter_var)]);
-    
-    let assumption = Bool::and(&[
-        // &inner_iter_var.ge(ast::Int::from_i64(0)),
-        &inner_iter_var.lt(&for_loop_end),
-    ]);
-    let growing_counterexample = Bool::and(&[
-        &assumption,
-        &Bool::and(&[x.le(&x_1), y.le(&y_1)]).not(),
-    ]);
-
-    let solver = Solver::new();
-    solver.assert(growing_counterexample);
-    if solver.check() == SatResult::Unsat{
-        return Increasing;
+    wavelet_elab::Expr{
+        stmts,
+        tail: tail.expect("MLIR block must contain a func.return"),
     }
-    let shrinking_counterexample = Bool::and(&[
-        &assumption,
-        &Bool::and(&[x.ge(&x_1), y.ge(&y_1)]).not(),
-    ]);
-    let solver = Solver::new();
-    solver.assert(shrinking_counterexample);
-    if solver.check() == SatResult::Unsat{
-        return Decreasing;
-    }
-    return Poison
 }
-
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os();
@@ -804,6 +469,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
     })?;
 
+
+    
     print_return_expressions(&module);
     loop_unswitching::loop_unswitch(&context, &mut module);
 
