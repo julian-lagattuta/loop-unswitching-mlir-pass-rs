@@ -1,17 +1,17 @@
-use std::{assert_eq, collections::{HashMap, HashSet}, env, error::Error, ffi::c_void, fs, io};
+use std::{assert_eq, collections::{HashMap, HashSet}, env, error::Error, ffi::c_void, fs, io, vec};
 
 use melior::{
     Context, IrRewriter, dialect::DialectRegistry, ir::{
-        BlockLike, BlockRef, Module, OperationRef, Region, RegionLike, RegionRef, ShapedTypeLike, Type, TypeLike, Value, ValueLike, attribute::{BoolAttribute, DenseI64ArrayAttribute, FlatSymbolRefAttribute, IntegerAttribute, StringAttribute, TypeAttribute}, operation::OperationLike, r#type::{DimSize, FunctionType, IntegerType, MemRefType},
+        BlockLike, BlockRef, Module, OperationRef, Region, RegionLike, RegionRef, ShapedTypeLike, Type, TypeLike, Value, ValueLike, attribute::{BoolAttribute, DenseI64ArrayAttribute, FlatSymbolRefAttribute, IntegerAttribute, StringAttribute, TypeAttribute}, operation::{OperationLike, OperationResult}, r#type::{DimSize, FunctionType, IntegerType, MemRefType},
     }, utility::register_all_dialects,
 };
 mod capabilities;
 mod loop_unswitching;
 mod util;
 use capabilities::print_return_expressions;
-use wavelet_elab::{Expr, FnDef, Program, Stmt, Ty, TypedVar, UntypedVar, Val, ir::{ArrayLen, Signedness}};
+use wavelet_elab::{Expr, FnDef, Op, Program, Stmt, Tail, Ty, TypedVar, UntypedVar, Val, ir::{ArrayLen, Signedness}};
 
-use crate::{capabilities::{Capability, to_wavelet_capability}, util::{BlockIter, FreshWaveletNames}};
+use crate::{capabilities::{Capability, generate_expr, to_wavelet_capability}, util::{BlockIter, FreshWaveletNames, fresh_wavelet_name}};
 fn scf_to_wavelet<'c>(module: Module<'c>) -> Option<Program<UntypedVar>> {
     todo!("ds");
     None
@@ -298,7 +298,7 @@ fn find_free_variables<'c, 'a>(block: BlockRef<'c, 'a>) -> Vec<Value<'c, 'a>> {
     free_variables
 }
 
-fn function_to_wavelet<'c, 'a>(func: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, func_map: HashMap<* mut c_void, Vec<Capability<'c, 'a>>>){
+fn function_to_wavelet<'c, 'a>(func: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, func_map: &mut HashMap<* mut c_void, Vec<Capability<'c, 'a>>>){
     let block = func.region(0).unwrap().first_block().unwrap();
     let alias_information = block.first_operation();
     let mut arguments = Vec::new();
@@ -359,7 +359,7 @@ fn function_to_wavelet<'c, 'a>(func: OperationRef<'c, 'a>, program: &mut Program
     let returns  = function_type.result(0)
         .map_or(Ty::Unit, |t| mlir_type_to_wavelet_ty(t));
 
-    let body = block_to_wavelet(block, program);
+    let body = block_to_wavelet(block, program, None,func_map);
     let wavelet_func = wavelet_elab::FnDef{
         name: wavelet_elab::FnName(name.to_string()), 
         params: arguments, 
@@ -376,40 +376,244 @@ fn value_to_typed_var(value: &Value<'_, '_>) -> TypedVar{
         ty: value_to_wavelet_ty(value) 
     }
 }
-fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, cap_map: HashMap<* mut c_void, Vec<Capability<'c, 'a>>>) ->  Expr<UntypedVar>{
+#[derive(Debug, Clone)]
+enum ForLoopParameterValue {
+    Constant(i64),
+    Variable(TypedVar),
+}
+fn for_loop_parameter_values<'c, 'a>(
+    for_loop: OperationRef<'c, 'a>,
+) -> (ForLoopParameterValue, ForLoopParameterValue) {
+    fn parameter_value<'c, 'a>(
+        for_loop: OperationRef<'c, 'a>,
+        operand_index: usize,
+    ) -> ForLoopParameterValue {
+        let value = for_loop.operand(operand_index).unwrap();
+        match generate_expr(value, Some(for_loop)).and_then(|expression| expression.constant_propagate()) {
+            Some(constant) => ForLoopParameterValue::Constant(constant),
+            None => ForLoopParameterValue::Variable(value_to_typed_var(&value)),
+        }
+    }
+
+    (parameter_value(for_loop, 1), parameter_value(for_loop, 2))
+}
+struct TailCallInformation {
+    function_name: wavelet_elab::FnName,
+    parameters: Vec<TypedVar>,
+    iteration_argument: UntypedVar,
+    next_iteration: UntypedVar,
+    carried_argument: Option<UntypedVar>,
+}
+
+impl TailCallInformation {
+    fn tail(&self, yielded: Option<UntypedVar>) -> Tail<UntypedVar> {
+        let arguments = self
+            .parameters
+            .iter()
+            .map(|parameter| {
+                if parameter.name == self.iteration_argument.0 {
+                    self.next_iteration.clone()
+                } else if self
+                    .carried_argument
+                    .as_ref()
+                    .is_some_and(|argument| parameter.name == argument.0)
+                {
+                    yielded
+                        .clone()
+                        .expect("loop with an iter_arg must yield a value")
+                } else {
+                    UntypedVar(parameter.name.clone())
+                }
+            })
+            .collect();
+        Tail::TailCall {
+            func: self.function_name.clone(),
+            args: arguments,
+        }
+    }
+}
+fn for_loop_function_parameters<'c, 'a>(
+    for_loop: OperationRef<'c, 'a>,
+    upper_bound: &ForLoopParameterValue,
+    step: &ForLoopParameterValue,
+) -> Vec<TypedVar> {
     let block = for_loop
         .first_region()
         .unwrap()
         .first_block()
         .unwrap();
-    
-    let params: Vec<TypedVar> = find_free_variables(block).iter().map(value_to_typed_var).collect();
+    let mut parameters: Vec<TypedVar> = find_free_variables(block)
+        .iter()
+        .map(value_to_typed_var)
+        .collect();
+
+    for parameter_value in [upper_bound, step] {
+        if let ForLoopParameterValue::Variable(parameter) = parameter_value
+            && !parameters
+                .iter()
+                .any(|existing| existing.name == parameter.name)
+        {
+            parameters.push(parameter.clone());
+        }
+    }
+    for argument_index in 0..block.argument_count() {
+        let argument: Value<'_, '_> = block.argument(argument_index).unwrap().into();
+        let parameter = value_to_typed_var(&argument);
+        if !parameters
+            .iter()
+            .any(|existing| existing.name == parameter.name)
+        {
+            parameters.push(parameter);
+        }
+    }
+
+    parameters
+}
+fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, cap_map: &mut HashMap<* mut c_void, Vec<Capability<'c, 'a>>>) ->  Stmt<UntypedVar>{
+    let block = for_loop
+        .first_region()
+        .unwrap()
+        .first_block()
+        .unwrap();
+    let (upper_bound, step) = for_loop_parameter_values(for_loop);
+    let params = for_loop_function_parameters(for_loop, &upper_bound, &step);
     let caps = to_wavelet_capability(
         cap_map
             .get(&for_loop.to_raw().ptr)
-            .expect("missing capabilities for scf.for"),
+            .unwrap()
     );
+    assert!(
+        for_loop.result_count() <= 1,
+        "Wavelet does not support scf.for with multiple iter_args"
+    );
+    let return_value = for_loop.result(0).ok();
+    let returns = return_value.map_or(Ty::Unit, |result| {
+        let value: Value<'_, '_> = result.into();
+        value_to_wavelet_ty(&value)
+    });
+    let function_name = wavelet_elab::FnName(for_loop_to_function_name(&for_loop));
+    let iteration_argument = UntypedVar(value_to_name(&block.argument(0).unwrap().into()));
+    let carried_argument = (block.argument_count() == 2).then(|| {
+        UntypedVar(value_to_name(&block.argument(1).unwrap().into()))
+    });
+    let mut body_stmts = Vec::new();
+    let upper_bound = match upper_bound {
+        ForLoopParameterValue::Constant(value) => {
+            let variable = UntypedVar(generator.fresh("_upper_bound"));
+            body_stmts.push(Stmt::LetVal {
+                var: variable.clone(),
+                val: Val::Int(value),
+                fence: false,
+            });
+            variable
+        }
+        ForLoopParameterValue::Variable(parameter) => UntypedVar(parameter.name),
+    };
+    let step = match step {
+        ForLoopParameterValue::Constant(value) => {
+            let variable = UntypedVar(generator.fresh("_step"));
+            body_stmts.push(Stmt::LetVal {
+                var: variable.clone(),
+                val: Val::Int(value),
+                fence: false,
+            });
+            variable
+        }
+        ForLoopParameterValue::Variable(parameter) => UntypedVar(parameter.name),
+    };
+    let condition = UntypedVar(generator.fresh("_loop_condition"));
+    body_stmts.push(Stmt::LetOp {
+        vars: vec![
+            iteration_argument.clone(),
+            upper_bound,
+            condition.clone(),
+        ],
+        op: Op::SignedLessThan,
+        fence: false,
+    });
+    let next_iteration = UntypedVar(generator.fresh("_next_iteration"));
+    let tail_call = TailCallInformation {
+        function_name: function_name.clone(),
+        parameters: params.clone(),
+        iteration_argument: iteration_argument.clone(),
+        next_iteration: next_iteration.clone(),
+        carried_argument: carried_argument.clone(),
+    };
+    let mut inner_body = block_to_wavelet(block, program, Some(&tail_call),cap_map);
+    inner_body.stmts.insert(0, Stmt::LetOp {
+        vars: vec![iteration_argument.clone(), step, next_iteration],
+        op: Op::Add,
+        fence: false,
+    });
+    let else_e = match &carried_argument {
+        Some(argument) => Expr {
+            stmts: Vec::new(),
+            tail: Tail::RetVar(argument.clone()),
+        },
+        None => {
+            let unit = UntypedVar(generator.fresh("_loop_unit"));
+            Expr {
+                stmts: vec![Stmt::LetVal {
+                    var: unit.clone(),
+                    val: Val::Unit,
+                    fence: false,
+                }],
+                tail: Tail::RetVar(unit),
+            }
+        }
+    };
+    let body = Expr {
+        stmts: body_stmts,
+        tail: Tail::IfElse {
+            cond: condition,
+            then_e: Box::new(inner_body),
+            else_e: Box::new(else_e),
+        },
+    };
+
+    let untyped_params: Vec<UntypedVar> = params.iter().map(|p| 
+        UntypedVar(p.name.clone())
+    ).collect();
     let func: FnDef<UntypedVar> = FnDef{
-        name: wavelet_elab::FnName(for_loop_to_function_name(&for_loop)),
-        params,
+        name: function_name,
+        params: params,
         alloc_arrays: Vec::new(),
         caps,
-        returns: todo!(),
-        body: todo!(),
+        returns,
+        body,
     };
+
     program.add_fn(func);
-    todo!()
+    let dummy_var = UntypedVar(fresh_wavelet_name("if_"));
+    let return_var = return_value.map_or(dummy_var, |f| UntypedVar(value_to_name(&f.into())));
+    let for_stmt: Stmt<UntypedVar> = Stmt::LetCall { 
+        vars: vec![return_var], 
+        func: wavelet_elab::FnName(for_loop_to_function_name(&for_loop)), 
+        args: untyped_params, 
+        fence: false
+    };
+    for_stmt
 }
-fn block_to_wavelet<'c, 'a>(block: BlockRef<'c, 'a>, program: &mut Program<UntypedVar>) -> wavelet_elab::Expr<UntypedVar>{
+fn block_to_wavelet<'c, 'a>(
+    block: BlockRef<'c, 'a>,
+    program: &mut Program<UntypedVar>,
+    tail_call: Option<&TailCallInformation>,
+    cap_map: &mut HashMap<* mut c_void, Vec<Capability<'c, 'a>>>
+) -> wavelet_elab::Expr<UntypedVar>{
     let mut stmts = Vec::new();
     let mut tail = None;
     for operation in BlockIter::new(block) {
         let ident = operation.name();
         let name = ident.as_string_ref().as_str().unwrap();
-        if name == "func.return"{
-            let returned = match operation.operand(0) {
-                Ok(value) => UntypedVar(value_to_name(&value)),
-                Err(_) => {
+        if name == "func.return" || name == "scf.yield"{
+            let yielded = operation
+                .operand(0)
+                .ok()
+                .map(|value| UntypedVar(value_to_name(&value)));
+            if name == "scf.yield" && tail_call.is_some() {
+                tail = Some(tail_call.unwrap().tail(yielded));
+            } else {
+                let returned = yielded.unwrap_or_else(|| {
                     let unit = UntypedVar("_unit_ret".to_string());
                     stmts.push(Stmt::LetVal {
                         var: unit.clone(),
@@ -417,9 +621,55 @@ fn block_to_wavelet<'c, 'a>(block: BlockRef<'c, 'a>, program: &mut Program<Untyp
                         fence: false,
                     });
                     unit
-                }
+                });
+                tail = Some(Tail::RetVar(returned));
+            }
+            break;
+        }else if name == "scf.if" {
+            let Some(yield_operation) = operation.next_in_block().filter(|next| {
+                next.name().as_string_ref().as_str().unwrap() == "scf.yield"
+            }) else {
+                continue;
             };
-            tail = Some(wavelet_elab::Tail::RetVar(returned));
+            let directly_yielded = match yield_operation.operand(0) {
+                Ok(value) => OperationResult::try_from(value)
+                    .is_ok_and(|result| result.owner().to_raw().ptr == operation.to_raw().ptr),
+                Err(_) => operation.result_count() == 0,
+            };
+            if !directly_yielded {
+                continue;
+            }
+            assert!(
+                operation.result_count() <= 1,
+                "Wavelet does not support scf.if with multiple results"
+            );
+            let condition = UntypedVar(value_to_name(&operation.operand(0).unwrap()));
+            let then_block = operation.region(0).unwrap().first_block().unwrap();
+            let then_e = block_to_wavelet(then_block, program, tail_call, cap_map);
+            let else_e = operation
+                .region(1)
+                .ok()
+                .and_then(|region| region.first_block())
+                .map(|else_block| block_to_wavelet(else_block, program, tail_call, cap_map))
+                .unwrap_or_else(|| {
+                    let unit = UntypedVar("_unit_ret".to_string());
+                    Expr {
+                        stmts: tail_call.is_none().then(|| Stmt::LetVal {
+                            var: unit.clone(),
+                            val: Val::Unit,
+                            fence: false,
+                        }).into_iter().collect(),
+                        tail: tail_call.map_or_else(
+                            || Tail::RetVar(unit),
+                            |information| information.tail(None),
+                        ),
+                    }
+                });
+            tail = Some(Tail::IfElse {
+                cond: condition,
+                then_e: Box::new(then_e),
+                else_e: Box::new(else_e),
+            });
             break;
         }else if operation.region_count() == 0 {
             let wavelet_op = operation_to_wavelet(operation, name);
@@ -429,13 +679,13 @@ fn block_to_wavelet<'c, 'a>(block: BlockRef<'c, 'a>, program: &mut Program<Untyp
             stmts.push(wavelet_op.unwrap());
 
         }else if name == "scf.for"{
-            
+            stmts.push(for_to_wavelet(operation, program, cap_map));
         }
     }
     
     wavelet_elab::Expr{
         stmts,
-        tail: tail.expect("MLIR block must contain a func.return"),
+        tail: tail.unwrap(),
     }
 }
 

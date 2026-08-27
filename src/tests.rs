@@ -9,7 +9,7 @@ use melior::{
 
 use super::capabilities::{
     CapabilityExpr, CapabilityOp, CapabilityType, Pattern, block_capabilities,
-    find_parent_iterator, generate_expr, z3_for_loop_viability,
+    find_parent_iterator, format_capabilities, generate_expr, z3_for_loop_viability,
 };
 
     fn test_context() -> Context {
@@ -160,7 +160,7 @@ use super::capabilities::{
         let not = greater.next_in_block().unwrap().next_in_block().unwrap();
 
         let wavelet_elab::Stmt::LetOp { vars, op, fence } =
-            super::operation_to_wavelet(greater, "arith.cmpi").unwrap().into_statement()
+            super::operation_to_wavelet(greater, "arith.cmpi").unwrap()
         else {
             unreachable!()
         };
@@ -183,7 +183,7 @@ use super::capabilities::{
         assert!(!fence);
 
         let wavelet_elab::Stmt::LetOp { vars, op, fence } =
-            super::operation_to_wavelet(not, "arith.xori").unwrap().into_statement()
+            super::operation_to_wavelet(not, "arith.xori").unwrap()
         else {
             unreachable!()
         };
@@ -257,7 +257,7 @@ use super::capabilities::{
             let identifier = current.name();
             let name = identifier.as_string_ref().as_str().unwrap();
             let wavelet_elab::Stmt::LetOp { vars, op, fence } =
-                super::operation_to_wavelet(current, name).unwrap().into_statement()
+                super::operation_to_wavelet(current, name).unwrap()
             else {
                 unreachable!()
             };
@@ -290,7 +290,7 @@ use super::capabilities::{
         let boolean = integer.next_in_block().unwrap();
 
         let wavelet_elab::Stmt::LetVal { val, fence, .. } =
-            super::operation_to_wavelet(integer, "arith.constant").unwrap().into_statement()
+            super::operation_to_wavelet(integer, "arith.constant").unwrap()
         else {
             unreachable!()
         };
@@ -298,7 +298,7 @@ use super::capabilities::{
         assert!(!fence);
 
         let wavelet_elab::Stmt::LetVal { val, fence, .. } =
-            super::operation_to_wavelet(boolean, "arith.constant").unwrap().into_statement()
+            super::operation_to_wavelet(boolean, "arith.constant").unwrap()
         else {
             unreachable!()
         };
@@ -328,7 +328,7 @@ use super::capabilities::{
         let store = load.next_in_block().unwrap();
 
         let wavelet_elab::Stmt::LetOp { vars, op, fence } =
-            super::operation_to_wavelet(load, "memref.load").unwrap().into_statement()
+            super::operation_to_wavelet(load, "memref.load").unwrap()
         else {
             unreachable!()
         };
@@ -347,7 +347,7 @@ use super::capabilities::{
         assert!(!fence);
 
         let wavelet_elab::Stmt::LetOp { vars, op, fence } =
-            super::operation_to_wavelet(store, "memref.store").unwrap().into_statement()
+            super::operation_to_wavelet(store, "memref.store").unwrap()
         else {
             unreachable!()
         };
@@ -440,7 +440,7 @@ use super::capabilities::{
             func,
             args,
             fence,
-        } = super::operation_to_wavelet(call, "func.call").unwrap().into_statement()
+        } = super::operation_to_wavelet(call, "func.call").unwrap()
         else {
             unreachable!()
         };
@@ -492,7 +492,7 @@ use super::capabilities::{
             .unwrap();
 
         let mut program = wavelet_elab::Program::new();
-        let value_expr = super::block_to_wavelet(value_block, &mut program);
+        let value_expr = super::block_to_wavelet(value_block, &mut program, None);
         let wavelet_elab::Tail::RetVar(value) = value_expr.tail
         else {
             unreachable!()
@@ -504,7 +504,7 @@ use super::capabilities::{
             ))
         );
 
-        let unit_expr = super::block_to_wavelet(unit_block, &mut program);
+        let unit_expr = super::block_to_wavelet(unit_block, &mut program, None);
         let wavelet_elab::Tail::RetVar(value) = unit_expr.tail
         else {
             unreachable!()
@@ -884,11 +884,229 @@ fn block_capabilities_promotes_loop_access_and_finds_parent_iterator() {
     assert_eq!(end.constant_propagate(), Some(3));
 
     let loop_capabilities = capability_map.get(&for_loop.to_raw().ptr).unwrap();
+    println!(
+        "shared loop capabilities: [{}]",
+        format_capabilities(loop_capabilities)
+    );
     assert_eq!(loop_capabilities.len(), 1);
     assert_eq!(loop_capabilities[0].capability_type, CapabilityType::Shrd);
     let (start, end) = loop_capabilities[0].capability_expr.as_ref().unwrap();
     assert_eq!(start.to_string(), "i");
     assert_eq!(end.constant_propagate(), Some(3));
+}
+
+#[test]
+fn for_loop_parameters_include_upper_bound_and_symbolic_step() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+                module {
+                    func.func @write(%array: memref<16xi32>, %lower: index, %upper: index, %step: index, %value: i32) {
+                        scf.for %i = %lower to %upper step %step {
+                            memref.store %value, %array[%i] : memref<16xi32>
+                            scf.yield
+                        }
+                        return
+                    }
+                    func.func @constant_step(%array: memref<16xi32>, %lower: index, %upper: index, %value: i32) {
+                        %c1 = arith.constant 1 : index
+                        scf.for %i = %lower to %upper step %c1 {
+                            memref.store %value, %array[%i] : memref<16xi32>
+                            scf.yield
+                        }
+                        return
+                    }
+                }
+            "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let lower: Value<'_, '_> = body.argument(1).unwrap().into();
+    let upper: Value<'_, '_> = body.argument(2).unwrap().into();
+    let step: Value<'_, '_> = body.argument(3).unwrap().into();
+    let for_loop = super::util::BlockIter::new(body)
+        .find(|operation| operation.name().as_string_ref().as_str().unwrap() == "scf.for")
+        .unwrap();
+
+    let (upper_parameter, step_parameter) = super::for_loop_parameter_values(for_loop);
+
+    let super::ForLoopParameterValue::Variable(upper_parameter) = upper_parameter else {
+        unreachable!()
+    };
+    let super::ForLoopParameterValue::Variable(step_parameter) = step_parameter else {
+        unreachable!()
+    };
+    assert_eq!(upper_parameter.name, super::value_to_name(&upper));
+    assert_eq!(step_parameter.name, super::value_to_name(&step));
+    assert_ne!(upper_parameter.name, super::value_to_name(&lower));
+
+    let constant_step_function = function.next_in_block().unwrap();
+    let constant_step_body = constant_step_function
+        .first_region()
+        .unwrap()
+        .first_block()
+        .unwrap();
+    let constant_step_loop = super::util::BlockIter::new(constant_step_body)
+        .find(|operation| operation.name().as_string_ref().as_str().unwrap() == "scf.for")
+        .unwrap();
+    let (constant_upper, constant_step) = super::for_loop_parameter_values(constant_step_loop);
+    assert!(matches!(constant_upper, super::ForLoopParameterValue::Variable(_)));
+    assert!(matches!(constant_step, super::ForLoopParameterValue::Constant(1)));
+}
+
+#[test]
+fn for_loop_function_parameters_include_unused_iter_args() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+                module {
+                    func.func @carry(%lower: index, %upper: index, %initial: i32) -> i32 {
+                        %c1 = arith.constant 1 : index
+                        %result = scf.for %i = %lower to %upper step %c1
+                            iter_args(%carried = %initial) -> i32 {
+                            %next = arith.constant 7 : i32
+                            scf.yield %next : i32
+                        }
+                        return %result : i32
+                    }
+                }
+            "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let for_loop = super::util::BlockIter::new(body)
+        .find(|operation| operation.name().as_string_ref().as_str().unwrap() == "scf.for")
+        .unwrap();
+    let loop_body = for_loop.first_region().unwrap().first_block().unwrap();
+    let iteration: Value<'_, '_> = loop_body.argument(0).unwrap().into();
+    let carried: Value<'_, '_> = loop_body.argument(1).unwrap().into();
+    let (upper_bound, step) = super::for_loop_parameter_values(for_loop);
+
+    let parameters = super::for_loop_function_parameters(for_loop, &upper_bound, &step);
+
+    assert!(parameters
+        .iter()
+        .any(|parameter| parameter.name == super::value_to_name(&iteration)));
+    assert!(parameters
+        .iter()
+        .any(|parameter| parameter.name == super::value_to_name(&carried)));
+}
+
+#[test]
+fn block_to_wavelet_uses_scf_yield_as_the_loop_body_tail() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+                module {
+                    func.func @carry(%initial: i32) -> i32 {
+                        %c0 = arith.constant 0 : index
+                        %c1 = arith.constant 1 : index
+                        %result = scf.for %i = %c0 to %c1 step %c1
+                            iter_args(%carried = %initial) -> i32 {
+                            scf.yield %carried : i32
+                        }
+                        return %result : i32
+                    }
+                }
+            "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let for_loop = super::util::BlockIter::new(body)
+        .find(|operation| operation.name().as_string_ref().as_str().unwrap() == "scf.for")
+        .unwrap();
+    let loop_body = for_loop.first_region().unwrap().first_block().unwrap();
+    let yielded = loop_body.first_operation().unwrap().operand(0).unwrap();
+    let mut program = wavelet_elab::Program::new();
+
+    let expression = super::block_to_wavelet(loop_body, &mut program, None);
+
+    assert_eq!(
+        expression.tail,
+        wavelet_elab::Tail::RetVar(wavelet_elab::UntypedVar(super::value_to_name(&yielded)))
+    );
+}
+
+#[test]
+fn block_to_wavelet_makes_a_directly_yielded_if_the_tail() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+                module {
+                    func.func @carry(%condition: i1, %initial: i32) -> i32 {
+                        %c0 = arith.constant 0 : index
+                        %c1 = arith.constant 1 : index
+                        %result = scf.for %i = %c0 to %c1 step %c1
+                            iter_args(%carried = %initial) -> i32 {
+                            %selected = scf.if %condition -> i32 {
+                                %then_value = arith.constant 7 : i32
+                                scf.yield %then_value : i32
+                            } else {
+                                %else_value = arith.constant 9 : i32
+                                scf.yield %else_value : i32
+                            }
+                            scf.yield %selected : i32
+                        }
+                        return %result : i32
+                    }
+                }
+            "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let for_loop = super::util::BlockIter::new(body)
+        .find(|operation| operation.name().as_string_ref().as_str().unwrap() == "scf.for")
+        .unwrap();
+    let loop_body = for_loop.first_region().unwrap().first_block().unwrap();
+    let iteration: Value<'_, '_> = loop_body.argument(0).unwrap().into();
+    let carried: Value<'_, '_> = loop_body.argument(1).unwrap().into();
+    let iteration = wavelet_elab::UntypedVar(super::value_to_name(&iteration));
+    let carried = wavelet_elab::UntypedVar(super::value_to_name(&carried));
+    let next_iteration = wavelet_elab::UntypedVar("next_iteration".to_string());
+    let function_name = wavelet_elab::FnName("loop".to_string());
+    let information = super::TailCallInformation {
+        function_name: function_name.clone(),
+        parameters: vec![
+            wavelet_elab::TypedVar {
+                name: iteration.0.clone(),
+                ty: wavelet_elab::Ty::Int(wavelet_elab::ir::Signedness::Signed),
+            },
+            wavelet_elab::TypedVar {
+                name: carried.0.clone(),
+                ty: wavelet_elab::Ty::Int(wavelet_elab::ir::Signedness::Signed),
+            },
+        ],
+        iteration_argument: iteration,
+        next_iteration: next_iteration.clone(),
+        carried_argument: Some(carried),
+    };
+    let mut program = wavelet_elab::Program::new();
+
+    let expression = super::block_to_wavelet(loop_body, &mut program, Some(&information));
+
+    let wavelet_elab::Tail::IfElse { then_e, else_e, .. } = expression.tail else {
+        unreachable!()
+    };
+    for branch in [*then_e, *else_e] {
+        let yielded = match branch.stmts.last().unwrap() {
+            wavelet_elab::Stmt::LetVal { var, .. } => var.clone(),
+            _ => unreachable!(),
+        };
+        let wavelet_elab::Tail::TailCall { func, args } = branch.tail else {
+            unreachable!()
+        };
+        assert_eq!(func, function_name);
+        assert_eq!(args[0], next_iteration);
+        assert_eq!(args[1], yielded);
+    }
 }
 
 #[test]
@@ -930,17 +1148,25 @@ fn block_capabilities_tracks_increasing_and_decreasing_unique_loop_caps() {
     block_capabilities(body, &mut capability_map, &mut capabilities);
 
     let increasing = capability_map.get(&loops[0].to_raw().ptr).unwrap();
+    println!(
+        "increasing loop capabilities: [{}]",
+        format_capabilities(increasing)
+    );
     assert_eq!(increasing.len(), 2);
     assert_eq!(increasing[0].capability_type, CapabilityType::Uniq);
     assert_eq!(increasing[1].capability_type, CapabilityType::Shrd);
     let (uniq_start, uniq_end) = increasing[0].capability_expr.as_ref().unwrap();
     let (shrd_start, shrd_end) = increasing[1].capability_expr.as_ref().unwrap();
-    assert_eq!(uniq_start.to_string(), "2 + i");
+    assert_eq!(uniq_start.to_string(), "i");
     assert_eq!(uniq_end.constant_propagate(), Some(3));
     assert_eq!(shrd_start.constant_propagate(), Some(2));
-    assert_eq!(shrd_end.to_string(), "2 + i - 1");
+    assert_eq!(shrd_end.to_string(), "i - 1");
 
     let decreasing = capability_map.get(&loops[1].to_raw().ptr).unwrap();
+    println!(
+        "decreasing loop capabilities: [{}]",
+        format_capabilities(decreasing)
+    );
     assert_eq!(decreasing.len(), 2);
     assert_eq!(decreasing[0].capability_type, CapabilityType::Uniq);
     assert_eq!(decreasing[1].capability_type, CapabilityType::Shrd);
@@ -986,6 +1212,10 @@ fn block_capabilities_keeps_poison_for_loop_caps_poisoned() {
     block_capabilities(body, &mut capability_map, &mut capabilities);
 
     let loop_capabilities = capability_map.get(&for_loop.to_raw().ptr).unwrap();
+    println!(
+        "poisoned loop capabilities: [{}]",
+        format_capabilities(loop_capabilities)
+    );
     assert_eq!(loop_capabilities.len(), 1);
     assert_eq!(loop_capabilities[0].capability_type, CapabilityType::Uniq);
     assert!(loop_capabilities[0].capability_expr.is_none());

@@ -706,13 +706,7 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
             let step =
                 generate_expr(step_var, Some(current)).and_then(|step| step.constant_propagate());
             let iterator: Value<'c, 'a> = inner_block.argument(0).unwrap().into();
-            let iteration = lower_bound.as_ref().map(|lower_bound| CapabilityExpr::BinOp {
-                operation: CapabilityOp::Add,
-                operands: (
-                    Rc::clone(lower_bound),
-                    Rc::new(CapabilityExpr::Variable(iterator)),
-                ),
-            });
+            let iteration = CapabilityExpr::Variable(iterator);
             let mut loop_capabilities = Vec::new();
 
             for capability in inner_capabilities {
@@ -753,7 +747,7 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
                             &end,
                             lower_bound.as_ref().unwrap(),
                             upper_bound.as_ref().unwrap(),
-                            iteration.as_ref().unwrap(),
+                            &iteration,
                             pattern,
                             current,
                         ) {
