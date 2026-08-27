@@ -682,10 +682,15 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
             }
         } else if name == "scf.if" {
             println!("[block_capabilities] descending into scf.if");
+            let mut if_capabilities = Vec::new();
             for region in current.regions() {
                 if let Some(sub_block) = region.first_block() {
-                    block_capabilities(sub_block, capability_map, capabilities);
+                    block_capabilities(sub_block, capability_map, &mut if_capabilities);
                 }
+            }
+            capability_map.insert(current.to_raw().ptr, if_capabilities.clone());
+            for capability in if_capabilities {
+                push_capability(capabilities, capability);
             }
         } else if name == "scf.for" {
             println!("[block_capabilities] collecting inner scf.for capabilities");

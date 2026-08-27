@@ -239,7 +239,10 @@ fn value_to_name(value: &Value<'_, '_>) -> String {
 fn for_loop_to_function_name(for_loop: &OperationRef<'_, '_>) -> String{
     let t= format!("f{:p}",for_loop.to_raw().ptr);
     t
-} 
+}
+fn if_to_function_name(if_statement: &OperationRef<'_, '_>) -> String {
+    format!("if_{:p}", if_statement.to_raw().ptr)
+}
 fn find_free_variables<'c, 'a>(block: BlockRef<'c, 'a>) -> Vec<Value<'c, 'a>> {
     fn collect_definitions<'c, 'a>(
         block: BlockRef<'c, 'a>,
@@ -469,6 +472,94 @@ fn for_loop_function_parameters<'c, 'a>(
 
     parameters
 }
+fn if_to_wavelet<'c, 'a>(
+    if_statement: OperationRef<'c, 'a>,
+    program: &mut Program<UntypedVar>,
+    cap_map: &mut HashMap<*mut c_void, Vec<Capability<'c, 'a>>>,
+) -> Stmt<UntypedVar> {
+    assert!(
+        if_statement.result_count() <= 1,
+        "Wavelet does not support scf.if with multiple results"
+    );
+
+    let condition = if_statement.operand(0).unwrap();
+    let mut parameter_values = vec![condition];
+    let mut seen = HashSet::from([condition.to_raw().ptr]);
+    for region in if_statement.regions() {
+        if let Some(block) = region.first_block() {
+            for value in find_free_variables(block) {
+                if seen.insert(value.to_raw().ptr) {
+                    parameter_values.push(value);
+                }
+            }
+        }
+    }
+    let parameters: Vec<TypedVar> = parameter_values
+        .iter()
+        .map(value_to_typed_var)
+        .collect();
+    let arguments = parameters
+        .iter()
+        .map(|parameter| UntypedVar(parameter.name.clone()))
+        .collect();
+
+    let return_value = if_statement.result(0).ok();
+    let returns = return_value.map_or(Ty::Unit, |result| {
+        let value: Value<'_, '_> = result.into();
+        value_to_wavelet_ty(&value)
+    });
+    let function_name = wavelet_elab::FnName(if_to_function_name(&if_statement));
+    let condition = UntypedVar(value_to_name(&condition));
+    let then_block = if_statement.region(0).unwrap().first_block().unwrap();
+    let then_e = block_to_wavelet(then_block, program, None, cap_map);
+    let else_e = if_statement
+        .region(1)
+        .ok()
+        .and_then(|region| region.first_block())
+        .map(|else_block| block_to_wavelet(else_block, program, None, cap_map))
+        .unwrap_or_else(|| {
+            let unit = UntypedVar(generator.fresh("_if_unit"));
+            Expr {
+                stmts: vec![Stmt::LetVal {
+                    var: unit.clone(),
+                    val: Val::Unit,
+                    fence: false,
+                }],
+                tail: Tail::RetVar(unit),
+            }
+        });
+    let caps = to_wavelet_capability(
+        cap_map
+            .get(&if_statement.to_raw().ptr)
+            .expect("missing capabilities for scf.if"),
+    );
+    program.add_fn(FnDef {
+        name: function_name.clone(),
+        params: parameters,
+        alloc_arrays: Vec::new(),
+        caps,
+        returns,
+        body: Expr {
+            stmts: Vec::new(),
+            tail: Tail::IfElse {
+                cond: condition,
+                then_e: Box::new(then_e),
+                else_e: Box::new(else_e),
+            },
+        },
+    });
+
+    let result = return_value.map_or_else(
+        || UntypedVar(generator.fresh("_if_result")),
+        |result| UntypedVar(value_to_name(&result.into())),
+    );
+    Stmt::LetCall {
+        vars: vec![result],
+        func: function_name,
+        args: arguments,
+        fence: false,
+    }
+}
 fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<UntypedVar>, cap_map: &mut HashMap<* mut c_void, Vec<Capability<'c, 'a>>>) ->  Stmt<UntypedVar>{
     let block = for_loop
         .first_region()
@@ -626,17 +717,18 @@ fn block_to_wavelet<'c, 'a>(
             }
             break;
         }else if name == "scf.if" {
-            let Some(yield_operation) = operation.next_in_block().filter(|next| {
+            let yield_operation = operation.next_in_block().filter(|next| {
                 next.name().as_string_ref().as_str().unwrap() == "scf.yield"
-            }) else {
-                continue;
-            };
-            let directly_yielded = match yield_operation.operand(0) {
-                Ok(value) => OperationResult::try_from(value)
-                    .is_ok_and(|result| result.owner().to_raw().ptr == operation.to_raw().ptr),
-                Err(_) => operation.result_count() == 0,
-            };
+            });
+            let directly_yielded = yield_operation.is_some_and(|yield_operation| {
+                match yield_operation.operand(0) {
+                    Ok(value) => OperationResult::try_from(value)
+                        .is_ok_and(|result| result.owner().to_raw().ptr == operation.to_raw().ptr),
+                    Err(_) => operation.result_count() == 0,
+                }
+            });
             if !directly_yielded {
+                stmts.push(if_to_wavelet(operation, program, cap_map));
                 continue;
             }
             assert!(

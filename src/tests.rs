@@ -492,7 +492,13 @@ use super::capabilities::{
             .unwrap();
 
         let mut program = wavelet_elab::Program::new();
-        let value_expr = super::block_to_wavelet(value_block, &mut program, None);
+        let mut capability_map = HashMap::new();
+        let value_expr = super::block_to_wavelet(
+            value_block,
+            &mut program,
+            None,
+            &mut capability_map,
+        );
         let wavelet_elab::Tail::RetVar(value) = value_expr.tail
         else {
             unreachable!()
@@ -504,7 +510,12 @@ use super::capabilities::{
             ))
         );
 
-        let unit_expr = super::block_to_wavelet(unit_block, &mut program, None);
+        let unit_expr = super::block_to_wavelet(
+            unit_block,
+            &mut program,
+            None,
+            &mut capability_map,
+        );
         let wavelet_elab::Tail::RetVar(value) = unit_expr.tail
         else {
             unreachable!()
@@ -1024,8 +1035,14 @@ fn block_to_wavelet_uses_scf_yield_as_the_loop_body_tail() {
     let loop_body = for_loop.first_region().unwrap().first_block().unwrap();
     let yielded = loop_body.first_operation().unwrap().operand(0).unwrap();
     let mut program = wavelet_elab::Program::new();
+    let mut capability_map = HashMap::new();
 
-    let expression = super::block_to_wavelet(loop_body, &mut program, None);
+    let expression = super::block_to_wavelet(
+        loop_body,
+        &mut program,
+        None,
+        &mut capability_map,
+    );
 
     assert_eq!(
         expression.tail,
@@ -1089,12 +1106,19 @@ fn block_to_wavelet_makes_a_directly_yielded_if_the_tail() {
         carried_argument: Some(carried),
     };
     let mut program = wavelet_elab::Program::new();
+    let mut capability_map = HashMap::new();
 
-    let expression = super::block_to_wavelet(loop_body, &mut program, Some(&information));
+    let expression = super::block_to_wavelet(
+        loop_body,
+        &mut program,
+        Some(&information),
+        &mut capability_map,
+    );
 
     let wavelet_elab::Tail::IfElse { then_e, else_e, .. } = expression.tail else {
         unreachable!()
     };
+    assert!(program.defs.is_empty());
     for branch in [*then_e, *else_e] {
         let yielded = match branch.stmts.last().unwrap() {
             wavelet_elab::Stmt::LetVal { var, .. } => var.clone(),
@@ -1107,6 +1131,54 @@ fn block_to_wavelet_makes_a_directly_yielded_if_the_tail() {
         assert_eq!(args[0], next_iteration);
         assert_eq!(args[1], yielded);
     }
+}
+
+#[test]
+fn block_to_wavelet_outlines_a_non_tail_if() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+                module {
+                    func.func @choose(%condition: i1, %input: i32) -> i32 {
+                        %selected = scf.if %condition -> i32 {
+                            %then_value = arith.addi %input, %input : i32
+                            scf.yield %then_value : i32
+                        } else {
+                            %else_value = arith.subi %input, %input : i32
+                            scf.yield %else_value : i32
+                        }
+                        %result = arith.addi %selected, %input : i32
+                        return %result : i32
+                    }
+                }
+            "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let block = function.first_region().unwrap().first_block().unwrap();
+    let if_statement = block.first_operation().unwrap();
+    let mut capability_map = HashMap::new();
+    let mut capabilities = Vec::new();
+    block_capabilities(block, &mut capability_map, &mut capabilities);
+    let mut program = wavelet_elab::Program::new();
+
+    let expression = super::block_to_wavelet(
+        block,
+        &mut program,
+        None,
+        &mut capability_map,
+    );
+
+    let wavelet_elab::Stmt::LetCall { vars, func, args, .. } = &expression.stmts[0] else {
+        unreachable!()
+    };
+    assert_eq!(vars[0].0, super::value_to_name(&if_statement.result(0).unwrap().into()));
+    assert_eq!(program.defs.len(), 1);
+    let outlined = &program.defs[0];
+    assert_eq!(func, &outlined.name);
+    assert_eq!(args.len(), outlined.params.len());
+    assert!(matches!(outlined.body.tail, wavelet_elab::Tail::IfElse { .. }));
 }
 
 #[test]
