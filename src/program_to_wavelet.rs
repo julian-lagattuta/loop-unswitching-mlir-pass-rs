@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use wavelet_elab::{
-    Expr, FnDef, Op, Program, Stmt, Tail, Ty, UntypedVar, Val,
     ir::{ArrayLen, Signedness},
     logic::{cap::CapPattern, region::Region, semantic::solver::Idx},
+    Expr, FnDef, Op, Program, Stmt, Tail, Ty, UntypedVar, Val,
 };
 
 pub fn program_to_wavelet(program: &Program<UntypedVar>) -> String {
@@ -127,6 +127,10 @@ fn write_region(output: &mut String, region: &Region) {
 
 fn write_idx(output: &mut String, index: &Idx) {
     match index {
+        Idx::Const(value) if *value < 0 => {
+            output.push_str("0 - ");
+            output.push_str(&value.unsigned_abs().to_string());
+        }
         Idx::Const(value) => output.push_str(&value.to_string()),
         Idx::Var(name) => output.push_str(name),
         Idx::Add(left, right) => {
@@ -414,9 +418,18 @@ fn indent(output: &mut String, depth: usize) {
 
 #[cfg(test)]
 mod tests {
-    use wavelet_elab::parse_program;
+    use wavelet_elab::{logic::semantic::solver::Idx, parse_program};
 
-    use super::program_to_wavelet;
+    use super::{program_to_wavelet, write_idx};
+
+    #[test]
+    fn negative_index_constants_are_written_as_subtraction_from_zero() {
+        let mut serialized = String::new();
+
+        write_idx(&mut serialized, &Idx::Const(-1));
+
+        assert_eq!(serialized, "0 - 1");
+    }
 
     #[test]
     fn serialized_program_can_be_parsed_by_wavelet() {

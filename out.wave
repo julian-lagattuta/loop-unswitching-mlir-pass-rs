@@ -1,45 +1,24 @@
-#[cap(arg2: shrd @ arg0 * 10 + arg1..arg0 * 10 + 10)]
-fn f0x5b8c2e61a620(arg0: i32, arg1: i32, arg2: &mut [i32; 100]) {
-    let v0 = 10;
+#[cap(arg0: shrd @ arg1..100)]
+fn f0x5cc3b2df7d60(arg0: &mut [i32; 100], arg1: i32, arg2: i32) -> i32 {
+    let v0 = 100;
     let v1 = 1;
     let v2 = arg1 < v0;
     if v2 {
         let v3 = arg1 + v1;
-        let v4 = 10;
-        let v5 = arg0 * v4;
-        let v6 = v5 + arg1;
-        let v7 = arg2[v6];
-        f0x5b8c2e61a620(arg0, v3, arg2)
+        let v4 = arg0[arg1];
+        let v5 = v4 + arg2;
+        f0x5cc3b2df7d60(arg0, v3, v5)
     } else {
-        let v8 = ();
-        v8
-    }
-}
-
-#[cap(arg1: shrd @ arg0 * 10..100)]
-fn f0x5b8c2e61a3d0(arg0: i32, arg1: &mut [i32; 100]) {
-    let v0 = 0;
-    let v1 = 10;
-    let v2 = 1;
-    let v3 = 10;
-    let v4 = 1;
-    let v5 = arg0 < v3;
-    if v5 {
-        let v6 = arg0 + v4;
-        let v7 = f0x5b8c2e61a620(arg0, v0, arg1);
-        f0x5b8c2e61a3d0(v6, arg1)
-    } else {
-        let v8 = ();
-        v8
+        arg2
     }
 }
 
 #[cap(arg0: shrd @ 0..100)]
-fn read_2d(arg0: &mut [i32; 100]) {
+fn sum(arg0: &mut [i32; 100]) -> i32 {
     let v0 = 0;
     let v1 = 1;
-    let v2 = 10;
-    let v3 = f0x5b8c2e61a3d0(v0, arg0);
-    let v4 = ();
+    let v2 = 100;
+    let v3 = 0;
+    let v4 = f0x5cc3b2df7d60(arg0, v0, v3);
     v4
 }

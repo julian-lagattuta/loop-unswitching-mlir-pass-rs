@@ -695,13 +695,23 @@ fn for_to_wavelet<'c, 'a>(for_loop: OperationRef<'c, 'a>, program: &mut Program<
         },
     };
 
+    let iter_arg = block.argument(1)
+        .ok()
+        .map(|f| {
+            let v: Value<'_, '_> = f.into(); 
+            value_to_name(&v)
+    });
+    let default_iter_arg = for_loop.operand(3).ok();
     let lower_bound = for_loop.operand(0).unwrap();
-    let untyped_params: Vec<UntypedVar> = params.iter().map(|p|
+    let untyped_params: Vec<UntypedVar> = params.iter().map(|p|{
         if p.name == iteration_argument.0 {
             UntypedVar(value_to_name(&lower_bound))
-        } else {
+        }else if let Some(name) = iter_arg.as_ref() && &p.name == name {
+            UntypedVar(value_to_name(default_iter_arg.as_ref().unwrap()))
+        }else {
             UntypedVar(p.name.clone())
         }
+    }
     ).collect();
     let func: FnDef<UntypedVar> = FnDef{
         name: function_name,
