@@ -10,7 +10,7 @@ use melior::{
 use super::capabilities::{
     Capability, CapabilityExpr, CapabilityOp, CapabilityType, Pattern, block_capabilities,
     capability_constants, find_parent_iterator, format_capabilities, generate_expr,
-    z3_for_loop_viability,
+    z3_assumptions, z3_for_loop_viability,
 };
 
     fn test_context() -> Context {
@@ -180,7 +180,7 @@ use super::capabilities::{
         let not = greater.next_in_block().unwrap().next_in_block().unwrap();
 
         let wavelet_elab::Stmt::LetOp { vars, op, fence } =
-            super::operation_to_wavelet(greater, "arith.cmpi").unwrap()
+            super::operation_to_wavelet(greater, "arith.cmpi").unwrap().unwrap()
         else {
             unreachable!()
         };
@@ -203,7 +203,7 @@ use super::capabilities::{
         assert!(!fence);
 
         let wavelet_elab::Stmt::LetOp { vars, op, fence } =
-            super::operation_to_wavelet(not, "arith.xori").unwrap()
+            super::operation_to_wavelet(not, "arith.xori").unwrap().unwrap()
         else {
             unreachable!()
         };
@@ -277,7 +277,7 @@ use super::capabilities::{
             let identifier = current.name();
             let name = identifier.as_string_ref().as_str().unwrap();
             let wavelet_elab::Stmt::LetOp { vars, op, fence } =
-                super::operation_to_wavelet(current, name).unwrap()
+                super::operation_to_wavelet(current, name).unwrap().unwrap()
             else {
                 unreachable!()
             };
@@ -310,7 +310,7 @@ use super::capabilities::{
         let boolean = integer.next_in_block().unwrap();
 
         let wavelet_elab::Stmt::LetVal { val, fence, .. } =
-            super::operation_to_wavelet(integer, "arith.constant").unwrap()
+            super::operation_to_wavelet(integer, "arith.constant").unwrap().unwrap()
         else {
             unreachable!()
         };
@@ -318,7 +318,7 @@ use super::capabilities::{
         assert!(!fence);
 
         let wavelet_elab::Stmt::LetVal { val, fence, .. } =
-            super::operation_to_wavelet(boolean, "arith.constant").unwrap()
+            super::operation_to_wavelet(boolean, "arith.constant").unwrap().unwrap()
         else {
             unreachable!()
         };
@@ -348,7 +348,7 @@ use super::capabilities::{
         let store = load.next_in_block().unwrap();
 
         let wavelet_elab::Stmt::LetOp { vars, op, fence } =
-            super::operation_to_wavelet(load, "memref.load").unwrap()
+            super::operation_to_wavelet(load, "memref.load").unwrap().unwrap()
         else {
             unreachable!()
         };
@@ -367,7 +367,7 @@ use super::capabilities::{
         assert!(!fence);
 
         let wavelet_elab::Stmt::LetOp { vars, op, fence } =
-            super::operation_to_wavelet(store, "memref.store").unwrap()
+            super::operation_to_wavelet(store, "memref.store").unwrap().unwrap()
         else {
             unreachable!()
         };
@@ -460,7 +460,7 @@ use super::capabilities::{
             func,
             args,
             fence,
-        } = super::operation_to_wavelet(call, "func.call").unwrap()
+        } = super::operation_to_wavelet(call, "func.call").unwrap().unwrap()
         else {
             unreachable!()
         };
@@ -628,10 +628,16 @@ fn capability_constants_folds_constant_values_in_the_capability_map() {
             array,
             capability_type: CapabilityType::Shrd,
             capability_expr: Some((
-                CapabilityExpr::Blackbox(sum),
+                CapabilityExpr::Blackbox {
+                    value: sum,
+                    signedness: wavelet_elab::ir::Signedness::Signed,
+                },
                 bin_op(
                     CapabilityOp::Add,
-                    CapabilityExpr::Blackbox(sum),
+                    CapabilityExpr::Blackbox {
+                        value: sum,
+                        signedness: wavelet_elab::ir::Signedness::Signed,
+                    },
                     CapabilityExpr::Constant(1),
                 ),
             )),
@@ -740,11 +746,20 @@ fn promote_replaces_variables_and_only_selected_blackboxes() {
 
     let expression = bin_op(
         CapabilityOp::Add,
-        CapabilityExpr::Variable(iterator),
+        CapabilityExpr::Variable {
+            value: iterator,
+            signedness: wavelet_elab::ir::Signedness::Signed,
+        },
         bin_op(
             CapabilityOp::Add,
-            CapabilityExpr::Blackbox(iterator),
-            CapabilityExpr::Blackbox(other_value),
+            CapabilityExpr::Blackbox {
+                value: iterator,
+                signedness: wavelet_elab::ir::Signedness::Signed,
+            },
+            CapabilityExpr::Blackbox {
+                value: other_value,
+                signedness: wavelet_elab::ir::Signedness::Signed,
+            },
         ),
     );
     let expression = expression
@@ -759,26 +774,32 @@ fn promote_replaces_variables_and_only_selected_blackboxes() {
         panic!("promotion should preserve the nested binary operation");
     };
     assert!(
-        matches!(operands.0.as_ref(), CapabilityExpr::Variable(value)
+        matches!(operands.0.as_ref(), CapabilityExpr::Variable { value, .. }
             if value.to_raw().ptr == iterator.to_raw().ptr)
     );
     assert!(
-        matches!(operands.1.as_ref(), CapabilityExpr::Blackbox(value)
+        matches!(operands.1.as_ref(), CapabilityExpr::Blackbox { value, .. }
             if value.to_raw().ptr == other_value.to_raw().ptr)
     );
     assert_eq!(expression.to_string(), "7 + i + arg1");
 
     let simple_symbolic = bin_op(
         CapabilityOp::Add,
-        CapabilityExpr::Variable(iterator),
+        CapabilityExpr::Variable {
+            value: iterator,
+            signedness: wavelet_elab::ir::Signedness::Signed,
+        },
         CapabilityExpr::Constant(5),
     );
     assert_eq!(simple_symbolic.to_string(), "i + 5");
 
-    let no_blackbox_promotion = CapabilityExpr::Blackbox(end_value)
+    let no_blackbox_promotion = CapabilityExpr::Blackbox {
+        value: end_value,
+        signedness: wavelet_elab::ir::Signedness::Signed,
+    }
         .promote(&CapabilityExpr::Constant(9), None)
         .unwrap();
-    assert!(matches!(no_blackbox_promotion, CapabilityExpr::Blackbox(_)));
+    assert!(matches!(no_blackbox_promotion, CapabilityExpr::Blackbox { .. }));
 }
 
 #[test]
@@ -851,13 +872,15 @@ fn generate_expr_classifies_values_relative_to_target_loop() {
 
     assert!(matches!(
         generate_expr(end_value, Some(for_loop)),
-        Some(CapabilityExpr::Blackbox(value))
+        Some(CapabilityExpr::Blackbox { value, signedness })
             if value.to_raw().ptr == end_value.to_raw().ptr
+                && signedness == wavelet_elab::ir::Signedness::Signed
     ));
     assert!(matches!(
         generate_expr(iterator, Some(for_loop)),
-        Some(CapabilityExpr::Variable(value))
+        Some(CapabilityExpr::Variable { value, signedness })
             if value.to_raw().ptr == iterator.to_raw().ptr
+                && signedness == wavelet_elab::ir::Signedness::Signed
     ));
     assert!(generate_expr(carried, Some(for_loop)).is_none());
     assert_eq!(
@@ -868,13 +891,15 @@ fn generate_expr_classifies_values_relative_to_target_loop() {
     );
     assert!(matches!(
         generate_expr(outside_math, Some(for_loop)),
-        Some(CapabilityExpr::Blackbox(value))
+        Some(CapabilityExpr::Blackbox { value, signedness })
             if value.to_raw().ptr == outside_math.to_raw().ptr
+                && signedness == wavelet_elab::ir::Signedness::Signed
     ));
     assert!(matches!(
         generate_expr(outside, Some(for_loop)),
-        Some(CapabilityExpr::Blackbox(value))
+        Some(CapabilityExpr::Blackbox { value, signedness })
             if value.to_raw().ptr == outside.to_raw().ptr
+                && signedness == wavelet_elab::ir::Signedness::Signed
     ));
     assert!(matches!(
         generate_expr(supported, Some(for_loop)),
@@ -882,10 +907,64 @@ fn generate_expr_classifies_values_relative_to_target_loop() {
     ));
     assert!(generate_expr(inside, Some(for_loop)).is_none());
     assert!(
-        CapabilityExpr::Blackbox(inside)
+        CapabilityExpr::Blackbox {
+            value: inside,
+            signedness: wavelet_elab::ir::Signedness::Signed,
+        }
             .promote(&CapabilityExpr::Constant(0), Some(for_loop))
             .is_none()
     );
+}
+
+#[test]
+fn generate_expr_uses_scf_for_unsigned_keyword_for_variable_signedness() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+                module {
+                    func.func @test(%lower: i32, %upper: i32, %step: i32, %outside: ui32) {
+                        scf.for unsigned %i = %lower to %upper step %step : i32 {
+                            scf.yield
+                        }
+                        return
+                    }
+                }
+            "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let body = function.first_region().unwrap().first_block().unwrap();
+    let lower: Value<'_, '_> = body.argument(0).unwrap().into();
+    let outside: Value<'_, '_> = body.argument(3).unwrap().into();
+    let for_loop = body.first_operation().unwrap();
+    let iterator: Value<'_, '_> = for_loop
+        .first_region()
+        .unwrap()
+        .first_block()
+        .unwrap()
+        .argument(0)
+        .unwrap()
+        .into();
+
+    assert!(matches!(
+        generate_expr(iterator, Some(for_loop)),
+        Some(CapabilityExpr::Variable { value, signedness })
+            if value.to_raw().ptr == iterator.to_raw().ptr
+                && signedness == wavelet_elab::ir::Signedness::Unsigned
+    ));
+    assert!(matches!(
+        generate_expr(lower, Some(for_loop)),
+        Some(CapabilityExpr::Blackbox { value, signedness })
+            if value.to_raw().ptr == lower.to_raw().ptr
+                && signedness == wavelet_elab::ir::Signedness::Signed
+    ));
+    assert!(matches!(
+        generate_expr(outside, Some(for_loop)),
+        Some(CapabilityExpr::Blackbox { value, signedness })
+            if value.to_raw().ptr == outside.to_raw().ptr
+                && signedness == wavelet_elab::ir::Signedness::Signed
+    ));
 }
 
 #[test]
@@ -927,7 +1006,23 @@ fn z3_detects_increasing_decreasing_and_poison_patterns() {
         .unwrap()
         .into();
 
-    let increasing = CapabilityExpr::Variable(iterator);
+    let unsigned_variable = || CapabilityExpr::Variable {
+        value: iterator,
+        signedness: wavelet_elab::ir::Signedness::Unsigned,
+    };
+    let increasing = unsigned_variable();
+    let assumption_i = z3::ast::Int::new_const("assumption_i");
+    let assumption_end = z3::ast::Int::new_const("assumption_end");
+    assert_eq!(
+        z3_assumptions(
+            &increasing,
+            &assumption_i,
+            &assumption_end,
+            &end_value,
+        )
+        .len(),
+        1
+    );
     assert_eq!(
         z3_for_loop_viability(&increasing, &increasing, &end_value),
         Pattern::Increasing
@@ -936,7 +1031,7 @@ fn z3_detects_increasing_decreasing_and_poison_patterns() {
     let decreasing = bin_op(
         CapabilityOp::Sub,
         CapabilityExpr::Constant(0),
-        CapabilityExpr::Variable(iterator),
+        unsigned_variable(),
     );
     assert_eq!(
         z3_for_loop_viability(&decreasing, &decreasing, &end_value),
@@ -945,17 +1040,40 @@ fn z3_detects_increasing_decreasing_and_poison_patterns() {
 
     let square = bin_op(
         CapabilityOp::Mult,
-        CapabilityExpr::Variable(iterator),
-        CapabilityExpr::Variable(iterator),
+        unsigned_variable(),
+        unsigned_variable(),
     );
     assert_eq!(
         z3_for_loop_viability(&square, &square, &end_value),
         Pattern::Increasing
     );
 
+    let signed_square = bin_op(
+        CapabilityOp::Mult,
+        CapabilityExpr::Variable {
+            value: iterator,
+            signedness: wavelet_elab::ir::Signedness::Signed,
+        },
+        CapabilityExpr::Variable {
+            value: iterator,
+            signedness: wavelet_elab::ir::Signedness::Signed,
+        },
+    );
+    assert_eq!(
+        z3_for_loop_viability(&signed_square, &signed_square, &end_value),
+        Pattern::Poison
+    );
+    assert!(z3_assumptions(
+        &signed_square,
+        &assumption_i,
+        &assumption_end,
+        &end_value,
+    )
+    .is_empty());
+
     let shifted = bin_op(
         CapabilityOp::Sub,
-        CapabilityExpr::Variable(iterator),
+        unsigned_variable(),
         CapabilityExpr::Constant(1),
     );
     let non_monotonic = bin_op(CapabilityOp::Mult, shifted.clone(), shifted);
@@ -966,8 +1084,11 @@ fn z3_detects_increasing_decreasing_and_poison_patterns() {
 
     let parameterized = bin_op(
         CapabilityOp::Mult,
-        CapabilityExpr::Variable(iterator),
-        CapabilityExpr::Blackbox(factor_value),
+        unsigned_variable(),
+        CapabilityExpr::Blackbox {
+            value: factor_value,
+            signedness: wavelet_elab::ir::Signedness::Signed,
+        },
     );
     assert_eq!(
         z3_for_loop_viability(&parameterized, &parameterized, &end_value),

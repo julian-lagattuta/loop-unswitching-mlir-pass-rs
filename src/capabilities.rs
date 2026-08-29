@@ -5,7 +5,10 @@ use std::{
 use melior::ir::{
     BlockLike, BlockRef, Module, OperationRef, RegionLike, ShapedTypeLike, Value, ValueLike, attribute::IntegerAttribute, block::BlockArgument, operation::{OperationLike, OperationResult, WalkOrder, WalkResult}, r#type::{DimSize, MemRefType},
 };
-use wavelet_elab::logic::{cap::CapPattern, region::{Interval, Region}, semantic::Idx};
+use wavelet_elab::{
+    ir::Signedness,
+    logic::{cap::CapPattern, region::{Interval, Region}, semantic::Idx},
+};
 use z3::{
     SatResult, Solver,
     ast::{self, Ast, Bool},
@@ -33,8 +36,14 @@ pub(super) enum CapabilityExpr<'c, 'a> {
         operands: (Rc<CapabilityExpr<'c, 'a>>, Rc<CapabilityExpr<'c, 'a>>), //inclusive range
     },
     Constant(i64),
-    Variable(Value<'c, 'a>),
-    Blackbox(Value<'c, 'a>),
+    Variable {
+        value: Value<'c, 'a>,
+        signedness: Signedness,
+    },
+    Blackbox {
+        value: Value<'c, 'a>,
+        signedness: Signedness,
+    },
 }
 
 impl<'c, 'a> CapabilityExpr<'c, 'a> {
@@ -55,10 +64,10 @@ impl<'c, 'a> CapabilityExpr<'c, 'a> {
                     CapabilityOp::Mult => Idx::Mul(Box::new(lhs), Box::new(rhs)),
                 }
             }
-            CapabilityExpr::Variable(value) => {
+            CapabilityExpr::Variable { value, .. } => {
                 Idx::Var(crate::value_to_name(value))
             }
-            CapabilityExpr::Blackbox(value) => Idx::Var(crate::value_to_name(value)),
+            CapabilityExpr::Blackbox { value, .. } => Idx::Var(crate::value_to_name(value)),
         }
     }
     pub(super) fn simplified(&self) -> CapabilityExpr<'c, 'a> {
@@ -126,8 +135,8 @@ impl<'c, 'a> CapabilityExpr<'c, 'a> {
                 ..
             } => 2,
             CapabilityExpr::Constant(_)
-            | CapabilityExpr::Variable(_)
-            | CapabilityExpr::Blackbox(_) => 3,
+            | CapabilityExpr::Variable { .. }
+            | CapabilityExpr::Blackbox { .. } => 3,
         }
     }
 
@@ -158,8 +167,10 @@ impl<'c, 'a> CapabilityExpr<'c, 'a> {
                 operands.1.fmt_compact(formatter, rhs_precedence)?;
             }
             CapabilityExpr::Constant(value) => write!(formatter, "{value}")?,
-            CapabilityExpr::Variable(_) => write!(formatter, "i")?,
-            CapabilityExpr::Blackbox(value) => write!(formatter, "{}", compact_value_name(*value))?,
+            CapabilityExpr::Variable { .. } => write!(formatter, "i")?,
+            CapabilityExpr::Blackbox { value, .. } => {
+                write!(formatter, "{}", compact_value_name(*value))?
+            }
         }
 
         if parenthesize {
@@ -183,8 +194,8 @@ impl<'c, 'a> CapabilityExpr<'c, 'a> {
                     Rc::new(operands.1.substitute_variable(variable_replacement)),
                 ),
             },
-            CapabilityExpr::Variable(_) => variable_replacement.clone(),
-            CapabilityExpr::Constant(_) | CapabilityExpr::Blackbox(_) => self.clone(),
+            CapabilityExpr::Variable { .. } => variable_replacement.clone(),
+            CapabilityExpr::Constant(_) | CapabilityExpr::Blackbox { .. } => self.clone(),
         }
     }
 
@@ -203,11 +214,11 @@ impl<'c, 'a> CapabilityExpr<'c, 'a> {
                     Rc::new(operands.1.expand_blackboxes(parent_for_loop)?),
                 ),
             }),
-            CapabilityExpr::Blackbox(value) => match parent_for_loop {
+            CapabilityExpr::Blackbox { value, .. } => match parent_for_loop {
                 Some(for_loop) => generate_expr(*value, Some(for_loop)),
                 None => Some(self.clone()),
             },
-            CapabilityExpr::Constant(_) | CapabilityExpr::Variable(_) => Some(self.clone()),
+            CapabilityExpr::Constant(_) | CapabilityExpr::Variable { .. } => Some(self.clone()),
         }
     }
 
@@ -236,7 +247,7 @@ impl<'c, 'a> CapabilityExpr<'c, 'a> {
                 }
             }
             CapabilityExpr::Constant(value) => Some(*value),
-            CapabilityExpr::Variable(_) | CapabilityExpr::Blackbox(_) => None,
+            CapabilityExpr::Variable { .. } | CapabilityExpr::Blackbox { .. } => None,
         }
     }
 
@@ -265,18 +276,19 @@ impl<'c, 'a> CapabilityExpr<'c, 'a> {
                 }
             }
             CapabilityExpr::Constant(value) => ast::Int::from_i64(*value),
-            CapabilityExpr::Variable(_) => iteration_variable.clone(),
-            CapabilityExpr::Blackbox(value)
+            CapabilityExpr::Variable { .. } => iteration_variable.clone(),
+            CapabilityExpr::Blackbox { value, .. }
                 if value.to_raw().ptr == for_loop_end_value.to_raw().ptr =>
             {
                 for_loop_end.clone()
             }
-            CapabilityExpr::Blackbox(value) => {
+            CapabilityExpr::Blackbox { value, .. } => {
                 let name = format!("blackbox_{:x}", value.to_raw().ptr as usize);
                 ast::Int::new_const(name)
             }
         }
     }
+
 }
 
 impl Display for CapabilityExpr<'_, '_> {
@@ -320,10 +332,10 @@ pub(super) fn capability_constants<'c, 'a>(
                     Rc::new(replace_constants(&operands.1)),
                 ),
             },
-            CapabilityExpr::Blackbox(value) => constant_fold_value(*value)
+            CapabilityExpr::Blackbox { value, .. } => constant_fold_value(*value)
                 .map(CapabilityExpr::Constant)
                 .unwrap_or_else(|| expression.clone()),
-            CapabilityExpr::Constant(_) | CapabilityExpr::Variable(_) => expression.clone(),
+            CapabilityExpr::Constant(_) | CapabilityExpr::Variable { .. } => expression.clone(),
         };
         replaced.simplified()
     }
@@ -438,8 +450,16 @@ pub(super) fn has_iteration_variable(expr: &CapabilityExpr<'_, '_>) -> bool {
         CapabilityExpr::BinOp { operands, .. } => {
             has_iteration_variable(&operands.0) || has_iteration_variable(&operands.1)
         }
-        CapabilityExpr::Variable(_) => true,
-        CapabilityExpr::Constant(_) | CapabilityExpr::Blackbox(_) => false,
+        CapabilityExpr::Variable { .. } => true,
+        CapabilityExpr::Constant(_) | CapabilityExpr::Blackbox { .. } => false,
+    }
+}
+
+fn for_loop_signedness(for_loop: OperationRef<'_, '_>) -> Signedness {
+    if for_loop.attribute("unsignedCmp").is_ok() {
+        Signedness::Unsigned
+    } else {
+        Signedness::Signed
     }
 }
 
@@ -524,7 +544,10 @@ where
             let iterator: Value<'c, 'a> = loop_body.argument(0).ok()?.into();
 
             if iterator.to_raw().ptr == value.to_raw().ptr {
-                return Some(CapabilityExpr::Variable(value));
+                return Some(CapabilityExpr::Variable {
+                    value,
+                    signedness: for_loop_signedness(for_loop),
+                });
             }
 
             if block_is_inside_operation(owner, for_loop) {
@@ -532,7 +555,10 @@ where
             }
         }
 
-        return Some(CapabilityExpr::Blackbox(value));
+        return Some(CapabilityExpr::Blackbox {
+            value,
+            signedness: Signedness::Signed,
+        });
     }
     let operation = OperationResult::try_from(value).ok()?;
     let operation = operation.owner();
@@ -546,7 +572,10 @@ where
     if !is_defined_inside_target {
         return Some(match constant_fold_value(value) {
             Some(value) => CapabilityExpr::Constant(value),
-            None => CapabilityExpr::Blackbox(value),
+            None => CapabilityExpr::Blackbox {
+                value,
+                signedness: Signedness::Signed,
+            },
         });
     }
 
@@ -745,7 +774,10 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
             let step =
                 generate_expr(step_var, Some(current)).and_then(|step| step.constant_propagate());
             let iterator: Value<'c, 'a> = inner_block.argument(0).unwrap().into();
-            let iteration = CapabilityExpr::Variable(iterator);
+            let iteration = CapabilityExpr::Variable {
+                value: iterator,
+                signedness: for_loop_signedness(current),
+            };
             let mut loop_capabilities = Vec::new();
 
             for capability in inner_capabilities {
@@ -998,6 +1030,49 @@ fn coalesce_capabilities<'c, 'a>(capabilities: Vec<Capability<'c, 'a>>){
 }
 fn coalesce_capabilities_by_array<'c, 'a>(capabilities: &Vec<Capability<'c,'a>>){
 }
+pub(super) fn z3_assumptions<'c, 'a>(
+    expression: &CapabilityExpr<'c, 'a>,
+    iteration_variable: &ast::Int,
+    for_loop_end: &ast::Int,
+    for_loop_end_value: &Value<'c, 'a>,
+) -> Vec<Bool> {
+    match expression {
+        CapabilityExpr::BinOp { operands, .. } => {
+            let mut assumptions = z3_assumptions(
+                &operands.0,
+                iteration_variable,
+                for_loop_end,
+                for_loop_end_value,
+            );
+            assumptions.extend(z3_assumptions(
+                &operands.1,
+                iteration_variable,
+                for_loop_end,
+                for_loop_end_value,
+            ));
+            assumptions
+        }
+        CapabilityExpr::Variable {
+            signedness: Signedness::Unsigned,
+            ..
+        }
+        | CapabilityExpr::Blackbox {
+            signedness: Signedness::Unsigned,
+            ..
+        } => vec![expression
+            .to_z3(iteration_variable, for_loop_end, for_loop_end_value)
+            .ge(ast::Int::from_i64(0))],
+        CapabilityExpr::Constant(_)
+        | CapabilityExpr::Variable {
+            signedness: Signedness::Signed,
+            ..
+        }
+        | CapabilityExpr::Blackbox {
+            signedness: Signedness::Signed,
+            ..
+        } => Vec::new(),
+    }
+}
 pub(super) fn z3_for_loop_viability<'c, 'a>(
     start: &CapabilityExpr<'c, 'a>,
     end: &CapabilityExpr<'c, 'a>,
@@ -1012,7 +1087,21 @@ pub(super) fn z3_for_loop_viability<'c, 'a>(
     let x_1 = x.substitute(&[(&inner_iter_var, &next_iter_var)]);
     let y_1 = y.substitute(&[(&inner_iter_var, &next_iter_var)]);
 
-    let assumption = Bool::and(&[&inner_iter_var.lt(&for_loop_end)]);
+    let mut assumptions = vec![inner_iter_var.lt(&for_loop_end)];
+    assumptions.extend(z3_assumptions(
+        start,
+        &inner_iter_var,
+        &for_loop_end,
+        for_loop_end_value,
+    ));
+    assumptions.extend(z3_assumptions(
+        end,
+        &inner_iter_var,
+        &for_loop_end,
+        for_loop_end_value,
+    ));
+    let assumption_refs = assumptions.iter().collect::<Vec<_>>();
+    let assumption = Bool::and(&assumption_refs);
     let growing_counterexample =
         Bool::and(&[&assumption, &Bool::and(&[x.le(&x_1), y.le(&y_1)]).not()]);
 

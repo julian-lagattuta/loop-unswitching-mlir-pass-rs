@@ -11,14 +11,15 @@ func.func @pivot(%a.0: memref<16xi32>) {
   %c4 = arith.constant 4 : index
 
   scf.for %k = %c0 to %c3 step %c1 {
-    %krow = arith.muli %k, %c4 : index
-
-    // p = k
-    %p = arith.addi %k, %c0 : index
 
     // if p <= k
     %ok = arith.cmpi ule, %p, %k : index
     scf.if %ok {
+          %krow = arith.muli %k, %c4 : index
+
+    // p = k
+      %p = arith.addi %k, %c0 : index
+
       %prow = arith.muli %p, %c4 : index
       %dstrow = arith.addi %krow, %c4 : index
       scf.for %j = %c0 to %c4 step %c1 {
