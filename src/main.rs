@@ -23,9 +23,9 @@ const generator: FreshWaveletNames = FreshWaveletNames::new();
 fn operation_to_wavelet<'c, 'a>(
     operation: OperationRef<'c, 'a>,
     name: &str,
-) -> Option<Stmt<UntypedVar>> {
+) -> Option<Option<Stmt<UntypedVar>>> {
     if name == "arith.constant" {
-        return constant_to_wavelet(operation);
+        return Some(constant_to_wavelet(operation));
     }
 
     if name == "memref.load" {
@@ -38,11 +38,11 @@ fn operation_to_wavelet<'c, 'a>(
         let len = wavelet_array_len(&operands[0])?;
         let result: Value<'_, '_> = operation.result(0).ok()?.into();
 
-        return Some(Stmt::LetOp {
+        return Some(Some(Stmt::LetOp {
             vars: vec![UntypedVar(value_to_name(&result))],
             op: wavelet_elab::Op::Load { array, index, len },
             fence: false,
-        });
+        }));
     }
 
     if name == "memref.store" {
@@ -55,7 +55,7 @@ fn operation_to_wavelet<'c, 'a>(
         let index = UntypedVar(value_to_name(&operands[2]));
         let len = wavelet_array_len(&operands[1])?;
 
-        return Some(Stmt::LetOp {
+        return Some(Some(Stmt::LetOp {
             vars: vec![],
             op: wavelet_elab::Op::Store {
                 array,
@@ -64,7 +64,7 @@ fn operation_to_wavelet<'c, 'a>(
                 len,
             },
             fence: false,
-        });
+        }));
     }
 
     if name == "func.call" {
@@ -94,14 +94,16 @@ fn operation_to_wavelet<'c, 'a>(
             Err(_) => UntypedVar(generator.fresh("_call_result")),
         };
 
-        return Some(Stmt::LetCall {
+        return Some(Some(Stmt::LetCall {
             vars: vec![result],
             func: wavelet_elab::FnName(callee.value().to_string()),
             args: scalar_args,
             fence: false,
-        });
+        }));
     }
-
+    if name == "memref.distinct_objects"{
+        return Some(None);
+    }
     let operands: Vec<_> = operation.operands().collect();
     if operands.len() != 2 {
         return None;
@@ -162,11 +164,11 @@ fn operation_to_wavelet<'c, 'a>(
         &operation.result(0).ok()?.into(),
     )));
 
-    Some(Stmt::LetOp {
+    Some(Some(Stmt::LetOp {
         vars,
         op,
         fence: false,
-    })
+    }))
 }
 
 fn constant_to_wavelet(operation: OperationRef<'_, '_>) -> Option<Stmt<UntypedVar>> {
@@ -814,9 +816,11 @@ fn block_to_wavelet<'c, 'a>(
         }else if operation.region_count() == 0 {
             let wavelet_op = operation_to_wavelet(operation, name);
             if wavelet_op.is_none(){
-                continue
+                panic!("unsupported operation {}", operation)
             }
-            stmts.push(wavelet_op.unwrap());
+            if let Some(wavelet_op) = wavelet_op.unwrap(){
+                stmts.push(wavelet_op);
+            }
 
         }else if name == "scf.for"{
             stmts.push(for_to_wavelet(operation, program, cap_map));

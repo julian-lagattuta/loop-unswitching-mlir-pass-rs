@@ -1,5 +1,5 @@
-#[cap(a: uniq @ k * 4 + 4 + j..k * 4 + 8, a: shrd @ k * 4 + j..k * 4 + 4)]
-fn inner_j(k: i32, j: u32, a: &mut [i32; 16]) {
+#[cap(a: uniq @ k * 4 + 4 + j..k * 4 + 8, a: shrd @ {k * 4 + j..k * 4 + 4})]
+fn inner_j(k: usize, j: usize, a: &mut [i32; 16]) {
     let row_len = 4;
     let step = 1;
     let more = j < row_len;
@@ -18,19 +18,14 @@ fn inner_j(k: i32, j: u32, a: &mut [i32; 16]) {
     }
 }
 
-#[cap(a: uniq @ 4..16, a: shrd@ 0..4)]
-fn outer_k(k: u32, a: &mut [i32; 16]) {
-
-    // uniq @ k * 4 + 4 + j..k * 4 + 8
-    // shrd @  k * 4 + j..k * 4 + 4
-    let row_len = 4;
+#[cap(a: uniq @0..16)]
+fn outer_k(k: usize, a: &mut [i32; 16]) {
     let zero = 0;
     let one = 1;
     let k_end = 3;
-    let step = 1;
     let more = k < k_end;
     if more {
-        let k_next = k + step;
+        let k_next = k + one;
         let inner_call = inner_j(k, zero, a);
         fence!();
         outer_k(k_next, a)
@@ -40,12 +35,9 @@ fn outer_k(k: u32, a: &mut [i32; 16]) {
     }
 }
 
-#[cap(a: uniq @ 0..16)]
+#[cap(a: uniq @ 4..16, a: uniq @ {0..4})]
 fn pivot(a: &mut [i32; 16]) {
     let k0 = 0;
-    let one = 1;
-    let three = 3;
-    let four = 4;
     let outer_call = outer_k(k0, a);
     let unit = ();
     unit

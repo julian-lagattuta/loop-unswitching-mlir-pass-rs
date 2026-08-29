@@ -938,13 +938,13 @@ fn loop_function_capabilities<'c, 'a>(
         capability_expr: Some((capability_start, capability_end)),
     }];
 
-    if capability_type == CapabilityType::Uniq {
-        capabilities.push(Capability {
-            array,
-            capability_type: CapabilityType::Shrd,
-            capability_expr: Some((shared_start, shared_end)),
-        });
-    }
+    // if capability_type == CapabilityType::Uniq {
+    //     capabilities.push(Capability {
+    //         array,
+    //         capability_type: CapabilityType::Shrd,
+    //         capability_expr: Some((shared_start, shared_end)),
+    //     });
+    // }
 
     capabilities
 }
@@ -989,7 +989,15 @@ fn pattern_to_capabilities<'c, 'a>(
         capability_expr,
     }
 }
+fn coalesce_capabilities<'c, 'a>(capabilities: Vec<Capability<'c, 'a>>){
+    let mut capabilities_by_array: HashMap<*const c_void, Capability<'_, '_>> = HashMap::new();
+    for capability in capabilities{
+        capabilities_by_array.insert(capability.array.to_raw().ptr, capability);
+    }
 
+}
+fn coalesce_capabilities_by_array<'c, 'a>(capabilities: &Vec<Capability<'c,'a>>){
+}
 pub(super) fn z3_for_loop_viability<'c, 'a>(
     start: &CapabilityExpr<'c, 'a>,
     end: &CapabilityExpr<'c, 'a>,
