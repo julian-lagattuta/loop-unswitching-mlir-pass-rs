@@ -9,8 +9,9 @@ use melior::{
 
 use super::capabilities::{
     Capability, CapabilityExpr, CapabilityOp, CapabilityType, Pattern, block_capabilities,
-    capability_constants, find_parent_iterator, format_capabilities, generate_expr,
-    z3_assumptions, z3_for_loop_viability,
+    capability_constants, coalesce_capabilities, coalesce_capabilities_by_array, coalesce_pair,
+    compute_capabilities, find_parent_iterator, format_capabilities, generate_expr, z3_assumptions,
+    z3_for_loop_viability,
 };
 
     fn test_context() -> Context {
@@ -1011,18 +1012,7 @@ fn z3_detects_increasing_decreasing_and_poison_patterns() {
         signedness: wavelet_elab::ir::Signedness::Unsigned,
     };
     let increasing = unsigned_variable();
-    let assumption_i = z3::ast::Int::new_const("assumption_i");
-    let assumption_end = z3::ast::Int::new_const("assumption_end");
-    assert_eq!(
-        z3_assumptions(
-            &increasing,
-            &assumption_i,
-            &assumption_end,
-            &end_value,
-        )
-        .len(),
-        1
-    );
+    assert_eq!(z3_assumptions(&increasing).len(), 1);
     assert_eq!(
         z3_for_loop_viability(&increasing, &increasing, &end_value),
         Pattern::Increasing
@@ -1063,13 +1053,7 @@ fn z3_detects_increasing_decreasing_and_poison_patterns() {
         z3_for_loop_viability(&signed_square, &signed_square, &end_value),
         Pattern::Poison
     );
-    assert!(z3_assumptions(
-        &signed_square,
-        &assumption_i,
-        &assumption_end,
-        &end_value,
-    )
-    .is_empty());
+    assert!(z3_assumptions(&signed_square).is_empty());
 
     let shifted = bin_op(
         CapabilityOp::Sub,
@@ -1094,6 +1078,372 @@ fn z3_detects_increasing_decreasing_and_poison_patterns() {
         z3_for_loop_viability(&parameterized, &parameterized, &end_value),
         Pattern::Poison
     );
+}
+
+#[test]
+fn coalesce_pair_subtracts_unique_interval_from_shared_interval() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        "module { func.func @test(%array: memref<10xi32>) { return } }",
+    )
+    .unwrap();
+    let array: Value<'_, '_> = module
+        .body()
+        .first_operation()
+        .unwrap()
+        .first_region()
+        .unwrap()
+        .first_block()
+        .unwrap()
+        .argument(0)
+        .unwrap()
+        .into();
+
+    let capability = |capability_type, bounds: Option<(i64, i64)>| Capability {
+        array,
+        capability_type,
+        capability_expr: bounds.map(|(start, end)| {
+            (
+                CapabilityExpr::Constant(start),
+                CapabilityExpr::Constant(end),
+            )
+        }),
+    };
+    let bounds = |capability: Option<Capability<'_, '_>>| {
+        capability.map(|capability| {
+            let (start, end) = capability.capability_expr.unwrap();
+            (
+                start.constant_propagate().unwrap(),
+                end.constant_propagate().unwrap(),
+            )
+        })
+    };
+
+    let run = |shrd_bounds, uniq_bounds| {
+        let shrd = capability(CapabilityType::Shrd, shrd_bounds);
+        let mut uniq = capability(CapabilityType::Uniq, uniq_bounds);
+        let (first, second, generated_uniq) = coalesce_pair(shrd, &mut uniq);
+        (bounds(first), bounds(second), bounds(generated_uniq))
+    };
+
+    assert_eq!(
+        run(Some((0, 2)), Some((5, 7))),
+        (Some((0, 2)), None, None)
+    );
+    assert_eq!(run(Some((2, 4)), Some((0, 6))), (None, None, None));
+    assert_eq!(
+        run(Some((1, 5)), Some((0, 2))),
+        (Some((3, 5)), None, None)
+    );
+    assert_eq!(
+        run(Some((1, 5)), Some((4, 8))),
+        (Some((1, 3)), None, None)
+    );
+    assert_eq!(
+        run(Some((1, 8)), Some((3, 5))),
+        (Some((1, 2)), Some((6, 8)), None)
+    );
+    assert_eq!(
+        run(None, Some((3, 5))),
+        (Some((0, 2)), Some((6, 9)), None)
+    );
+    assert_eq!(run(Some((3, 5)), None), (None, None, None));
+    assert_eq!(run(Some((5, 4)), Some((0, 1))), (None, None, None));
+    assert_eq!(run(Some((2, 4)), Some((2, 4))), (None, None, None));
+    assert_eq!(
+        run(Some((1, 5)), Some((5, 8))),
+        (Some((1, 4)), None, None)
+    );
+    assert_eq!(
+        run(Some((0, 1)), Some((5, 4))),
+        (Some((0, 1)), None, None)
+    );
+}
+
+#[test]
+fn coalesce_capabilities_by_array_applies_each_unique_to_remaining_shared() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        "module { func.func @test(%array: memref<10xi32>, %x2: ui32, %y2: ui32) { return } }",
+    )
+    .unwrap();
+    let block = module
+        .body()
+        .first_operation()
+        .unwrap()
+        .first_region()
+        .unwrap()
+        .first_block()
+        .unwrap();
+    let array: Value<'_, '_> = block.argument(0).unwrap().into();
+    let x2: Value<'_, '_> = block.argument(1).unwrap().into();
+    let y2: Value<'_, '_> = block.argument(2).unwrap().into();
+    let capability = |capability_type, start, end| Capability {
+        array,
+        capability_type,
+        capability_expr: Some((
+            CapabilityExpr::Constant(start),
+            CapabilityExpr::Constant(end),
+        )),
+    };
+
+    let capabilities = coalesce_capabilities_by_array(vec![
+        capability(CapabilityType::Shrd, 0, 9),
+        capability(CapabilityType::Uniq, 2, 3),
+        capability(CapabilityType::Uniq, 6, 7),
+    ]);
+    let bounds = |capability: &Capability<'_, '_>| {
+        let (start, end) = capability.capability_expr.as_ref().unwrap();
+        (
+            start.constant_propagate().unwrap(),
+            end.constant_propagate().unwrap(),
+        )
+    };
+    let uniq_bounds = capabilities
+        .iter()
+        .filter(|capability| capability.capability_type == CapabilityType::Uniq)
+        .map(bounds)
+        .collect::<Vec<_>>();
+    let shrd_bounds = capabilities
+        .iter()
+        .filter(|capability| capability.capability_type == CapabilityType::Shrd)
+        .map(bounds)
+        .collect::<Vec<_>>();
+
+    assert_eq!(uniq_bounds, vec![(2, 3), (6, 7)]);
+    assert_eq!(shrd_bounds, vec![(0, 1), (4, 5), (8, 9)]);
+
+    let x_end = bin_op(
+        CapabilityOp::Add,
+        CapabilityExpr::Blackbox {
+            value: x2,
+            signedness: wavelet_elab::ir::Signedness::Unsigned,
+        },
+        CapabilityExpr::Constant(2),
+    );
+    let y_end = bin_op(
+        CapabilityOp::Add,
+        CapabilityExpr::Blackbox {
+            value: y2,
+            signedness: wavelet_elab::ir::Signedness::Unsigned,
+        },
+        CapabilityExpr::Constant(2),
+    );
+    let capabilities = coalesce_capabilities_by_array(vec![
+        Capability {
+            array,
+            capability_type: CapabilityType::Shrd,
+            capability_expr: Some((CapabilityExpr::Constant(0), y_end)),
+        },
+        Capability {
+            array,
+            capability_type: CapabilityType::Uniq,
+            capability_expr: Some((CapabilityExpr::Constant(2), x_end)),
+        },
+    ]);
+    let uniq_capabilities = capabilities
+        .iter()
+        .filter(|capability| capability.capability_type == CapabilityType::Uniq)
+        .collect::<Vec<_>>();
+    let shrd_capabilities = capabilities
+        .iter()
+        .filter(|capability| capability.capability_type == CapabilityType::Shrd)
+        .collect::<Vec<_>>();
+
+    assert_eq!(uniq_capabilities.len(), 2);
+    assert_eq!(shrd_capabilities.len(), 1);
+    assert_eq!(bounds(shrd_capabilities[0]), (0, 1));
+    let (generated_start, generated_end) = uniq_capabilities[1]
+        .capability_expr
+        .as_ref()
+        .unwrap();
+    assert_eq!(generated_start.to_string(), "arg1 + 3");
+    assert_eq!(generated_end.to_string(), "arg2 + 2");
+
+    let iteration = CapabilityExpr::Blackbox {
+        value: x2,
+        signedness: wavelet_elab::ir::Signedness::Signed,
+    };
+    let shrd = Capability {
+        array,
+        capability_type: CapabilityType::Shrd,
+        capability_expr: Some((iteration.clone(), CapabilityExpr::Constant(3))),
+    };
+    let mut uniq = Capability {
+        array,
+        capability_type: CapabilityType::Uniq,
+        capability_expr: Some((
+            bin_op(
+                CapabilityOp::Add,
+                iteration,
+                CapabilityExpr::Constant(4),
+            ),
+            CapabilityExpr::Constant(7),
+        )),
+    };
+    let (unchanged_shrd, second_shrd, generated_uniq) = coalesce_pair(shrd, &mut uniq);
+    let (unchanged_start, unchanged_end) = unchanged_shrd
+        .unwrap()
+        .capability_expr
+        .unwrap();
+    assert_eq!(unchanged_start.to_string(), "arg1");
+    assert_eq!(unchanged_end.constant_propagate(), Some(3));
+    assert!(second_shrd.is_none());
+    assert!(generated_uniq.is_none());
+
+    let iteration = CapabilityExpr::Blackbox {
+        value: x2,
+        signedness: wavelet_elab::ir::Signedness::Signed,
+    };
+    let row_start = bin_op(
+        CapabilityOp::Mult,
+        iteration,
+        CapabilityExpr::Constant(4),
+    );
+    let shrd = Capability {
+        array,
+        capability_type: CapabilityType::Shrd,
+        capability_expr: Some((row_start.clone(), CapabilityExpr::Constant(11))),
+    };
+    let mut uniq = Capability {
+        array,
+        capability_type: CapabilityType::Uniq,
+        capability_expr: Some((
+            bin_op(
+                CapabilityOp::Add,
+                row_start,
+                CapabilityExpr::Constant(4),
+            ),
+            CapabilityExpr::Constant(15),
+        )),
+    };
+    let (coalesced_shrd, second_shrd, generated_uniq) = coalesce_pair(shrd, &mut uniq);
+    let (coalesced_start, coalesced_end) = coalesced_shrd
+        .unwrap()
+        .capability_expr
+        .unwrap();
+    assert_eq!(coalesced_start.to_string(), "arg1 * 4");
+    assert_eq!(coalesced_end.to_string(), "arg1 * 4 + 4 - 1");
+    assert!(second_shrd.is_none());
+    assert!(generated_uniq.is_none());
+
+    let capabilities = coalesce_capabilities_by_array(vec![
+        capability(CapabilityType::Shrd, 5, 4),
+        capability(CapabilityType::Uniq, 7, 6),
+    ]);
+    assert!(capabilities.is_empty());
+}
+
+#[test]
+fn coalesce_capabilities_processes_each_array_independently() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        "module { func.func @test(%a: memref<10xi32>, %b: memref<10xi32>) { return } }",
+    )
+    .unwrap();
+    let block = module
+        .body()
+        .first_operation()
+        .unwrap()
+        .first_region()
+        .unwrap()
+        .first_block()
+        .unwrap();
+    let a: Value<'_, '_> = block.argument(0).unwrap().into();
+    let b: Value<'_, '_> = block.argument(1).unwrap().into();
+    let capability = |array, capability_type, start, end| Capability {
+        array,
+        capability_type,
+        capability_expr: Some((
+            CapabilityExpr::Constant(start),
+            CapabilityExpr::Constant(end),
+        )),
+    };
+
+    let capabilities = coalesce_capabilities(vec![
+        capability(a, CapabilityType::Shrd, 0, 5),
+        capability(b, CapabilityType::Shrd, 0, 5),
+        capability(a, CapabilityType::Uniq, 2, 3),
+        capability(b, CapabilityType::Uniq, 4, 5),
+    ]);
+
+    assert_eq!(
+        format_capabilities(&capabilities),
+        "arg0: uniq @ 2..3, arg0: shrd @ 0..1, arg0: shrd @ 4..5, arg1: uniq @ 4..5, arg1: shrd @ 0..3"
+    );
+}
+
+#[test]
+fn compute_capabilities_coalesces_if_and_function_capabilities() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+            module {
+                func.func @test(%array: memref<4xi32>, %condition: i1, %value: i32) {
+                    %c0 = arith.constant 0 : index
+                    scf.if %condition {
+                        %loaded = memref.load %array[%c0] : memref<4xi32>
+                        scf.yield
+                    } else {
+                        memref.store %value, %array[%c0] : memref<4xi32>
+                        scf.yield
+                    }
+                    return
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let if_operation = super::util::BlockIter::new(function.first_region().unwrap().first_block().unwrap())
+        .find(|operation| operation.name().as_string_ref().as_str().unwrap() == "scf.if")
+        .unwrap();
+
+    let capability_map = compute_capabilities(&module);
+    let if_capabilities = &capability_map[&if_operation.to_raw().ptr];
+    let function_capabilities = &capability_map[&function.to_raw().ptr];
+
+    assert_eq!(format_capabilities(if_capabilities), "arg0: uniq @ 0..0");
+    assert_eq!(format_capabilities(function_capabilities), "arg0: uniq @ 0..0");
+}
+
+#[test]
+fn block_capabilities_coalesces_loop_before_lower_bound_substitution() {
+    let context = test_context();
+    let module = Module::parse(
+        &context,
+        r#"
+            module {
+                func.func @test(%array: memref<4xi32>, %value: i32) {
+                    %c0 = arith.constant 0 : index
+                    %c1 = arith.constant 1 : index
+                    %c4 = arith.constant 4 : index
+                    scf.for %i = %c0 to %c4 step %c1 {
+                        %loaded = memref.load %array[%i] : memref<4xi32>
+                        memref.store %value, %array[%i] : memref<4xi32>
+                        scf.yield
+                    }
+                    return
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    let function = module.body().first_operation().unwrap();
+    let for_loop = super::util::BlockIter::new(function.first_region().unwrap().first_block().unwrap())
+        .find(|operation| operation.name().as_string_ref().as_str().unwrap() == "scf.for")
+        .unwrap();
+
+    let capability_map = compute_capabilities(&module);
+    let loop_capabilities = &capability_map[&for_loop.to_raw().ptr];
+    let function_capabilities = &capability_map[&function.to_raw().ptr];
+
+    assert_eq!(format_capabilities(loop_capabilities), "arg0: uniq @ i..3");
+    assert_eq!(format_capabilities(function_capabilities), "arg0: uniq @ 0..3");
 }
 
 #[test]
@@ -1472,30 +1822,22 @@ fn block_capabilities_tracks_increasing_and_decreasing_unique_loop_caps() {
         "increasing loop capabilities: [{}]",
         format_capabilities(increasing)
     );
-    assert_eq!(increasing.len(), 2);
+    assert_eq!(increasing.len(), 1);
     assert_eq!(increasing[0].capability_type, CapabilityType::Uniq);
-    assert_eq!(increasing[1].capability_type, CapabilityType::Shrd);
     let (uniq_start, uniq_end) = increasing[0].capability_expr.as_ref().unwrap();
-    let (shrd_start, shrd_end) = increasing[1].capability_expr.as_ref().unwrap();
     assert_eq!(uniq_start.to_string(), "i");
     assert_eq!(uniq_end.constant_propagate(), Some(3));
-    assert_eq!(shrd_start.constant_propagate(), Some(2));
-    assert_eq!(shrd_end.to_string(), "i - 1");
 
     let decreasing = capability_map.get(&loops[1].to_raw().ptr).unwrap();
     println!(
         "decreasing loop capabilities: [{}]",
         format_capabilities(decreasing)
     );
-    assert_eq!(decreasing.len(), 2);
+    assert_eq!(decreasing.len(), 1);
     assert_eq!(decreasing[0].capability_type, CapabilityType::Uniq);
-    assert_eq!(decreasing[1].capability_type, CapabilityType::Shrd);
     let (uniq_start, uniq_end) = decreasing[0].capability_expr.as_ref().unwrap();
-    let (shrd_start, shrd_end) = decreasing[1].capability_expr.as_ref().unwrap();
     assert_eq!(uniq_start.constant_propagate(), Some(0));
     assert_eq!(uniq_end.to_string(), "3 - i");
-    assert_eq!(shrd_start.to_string(), "3 - i + 1");
-    assert_eq!(shrd_end.constant_propagate(), Some(3));
 }
 
 #[test]
@@ -1595,9 +1937,7 @@ fn block_capabilities_handles_nested_quadratic_access() {
 
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability_type, CapabilityType::Uniq);
-    let (start, end) = capabilities[0].capability_expr.as_ref().unwrap();
-    assert_eq!(start.constant_propagate(), Some(7));
-    assert_eq!(end.constant_propagate(), Some(232));
+    assert!(capabilities[0].capability_expr.is_none());
 }
 
 #[test]

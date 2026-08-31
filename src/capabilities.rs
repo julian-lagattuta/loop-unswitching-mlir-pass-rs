@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap, ffi::c_void, fmt::{self, Display, Formatter}, rc::Rc,
+    collections::{HashMap, VecDeque}, ffi::c_void, fmt::{self, Display, Formatter}, rc::Rc,
 };
 
 use melior::ir::{
@@ -10,8 +10,7 @@ use wavelet_elab::{
     logic::{cap::CapPattern, region::{Interval, Region}, semantic::Idx},
 };
 use z3::{
-    SatResult, Solver,
-    ast::{self, Ast, Bool},
+    SatResult, Solver, ast::{self, Ast, Bool},
 };
 
 use crate::{util::BlockIter, value_to_name};
@@ -251,23 +250,14 @@ impl<'c, 'a> CapabilityExpr<'c, 'a> {
         }
     }
 
-    pub(super) fn to_z3(
-        &self,
-        iteration_variable: &ast::Int,
-        for_loop_end: &ast::Int,
-        for_loop_end_value: &Value<'_, '_>,
-    ) -> ast::Int {
+    pub(super) fn to_z3(&self) -> ast::Int {
         match self {
             CapabilityExpr::BinOp {
                 operation,
                 operands,
             } => {
-                let lhs = operands
-                    .0
-                    .to_z3(iteration_variable, for_loop_end, for_loop_end_value);
-                let rhs = operands
-                    .1
-                    .to_z3(iteration_variable, for_loop_end, for_loop_end_value);
+                let lhs = operands.0.to_z3();
+                let rhs = operands.1.to_z3();
 
                 match operation {
                     CapabilityOp::Add => ast::Int::add(&[&lhs, &rhs]),
@@ -276,19 +266,26 @@ impl<'c, 'a> CapabilityExpr<'c, 'a> {
                 }
             }
             CapabilityExpr::Constant(value) => ast::Int::from_i64(*value),
-            CapabilityExpr::Variable { .. } => iteration_variable.clone(),
-            CapabilityExpr::Blackbox { value, .. }
-                if value.to_raw().ptr == for_loop_end_value.to_raw().ptr =>
-            {
-                for_loop_end.clone()
-            }
-            CapabilityExpr::Blackbox { value, .. } => {
-                let name = format!("blackbox_{:x}", value.to_raw().ptr as usize);
-                ast::Int::new_const(name)
-            }
+            CapabilityExpr::Variable { value, .. }
+            | CapabilityExpr::Blackbox { value, .. } => value_to_z3(value),
         }
     }
 
+    fn iteration_variable_to_z3(&self) -> Option<ast::Int> {
+        match self {
+            CapabilityExpr::BinOp { operands, .. } => operands
+                .0
+                .iteration_variable_to_z3()
+                .or_else(|| operands.1.iteration_variable_to_z3()),
+            CapabilityExpr::Variable { value, .. } => Some(value_to_z3(value)),
+            CapabilityExpr::Constant(_) | CapabilityExpr::Blackbox { .. } => None,
+        }
+    }
+
+}
+
+fn value_to_z3(value: &Value<'_, '_>) -> ast::Int {
+    ast::Int::new_const(format!("value_{:x}", value.to_raw().ptr as usize))
 }
 
 impl Display for CapabilityExpr<'_, '_> {
@@ -685,7 +682,7 @@ where 'c: 'a
             &mut map, &mut caps
         );
         hashmap.extend(map);
-        hashmap.insert(func.to_raw().ptr, caps);
+        hashmap.insert(func.to_raw().ptr, coalesce_capabilities(caps));
     }
     hashmap
 }
@@ -751,6 +748,7 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
                     block_capabilities(sub_block, capability_map, &mut if_capabilities);
                 }
             }
+            let if_capabilities = coalesce_capabilities(if_capabilities);
             capability_map.insert(current.to_raw().ptr, if_capabilities.clone());
             for capability in if_capabilities {
                 push_capability(capabilities, capability);
@@ -792,18 +790,16 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
                         if has_iteration_variable(&start) || has_iteration_variable(&end) =>
                     {
                         if is_range_poisoned || step.is_none() {
-                            let loop_capability = Capability {
-                                array,
-                                capability_type,
-                                capability_expr: None,
-                            };
-                            push_capability(&mut loop_capabilities, loop_capability.clone());
-                            let inserted = push_capability(
-                                capabilities,
-                                loop_capability,
+                            push_capability(
+                                &mut loop_capabilities,
+                                Capability {
+                                    array,
+                                    capability_type,
+                                    capability_expr: None,
+                                },
                             );
                             println!(
-                                "[block_capabilities] poisoned loop capability because a loop bound is unknown; inserted={inserted}"
+                                "[block_capabilities] poisoned loop capability because a loop bound is unknown"
                             );
                             continue;
                         }
@@ -816,37 +812,12 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
                             capability_type,
                             &start,
                             &end,
-                            lower_bound.as_ref().unwrap(),
                             upper_bound.as_ref().unwrap(),
                             &iteration,
                             pattern,
                             current,
                         ) {
                             push_capability(&mut loop_capabilities, loop_capability);
-                        }
-
-                        let inserted = push_capability(
-                            capabilities,
-                            pattern_to_capabilities(
-                                array,
-                                capability_type,
-                                start,
-                                end,
-                                Rc::clone(lower_bound.as_ref().unwrap()),
-                                Rc::clone(upper_bound.as_ref().unwrap()),
-                                pattern,
-                                parent_for_loop,
-                            ),
-                        );
-                        if inserted {
-                            println!(
-                                "[block_capabilities] promoted loop capability: {}",
-                                capabilities.last().unwrap()
-                            );
-                        } else {
-                            println!(
-                                "[block_capabilities] promoted loop capability already covered"
-                            );
                         }
                     }
                     capability_expr => {
@@ -855,29 +826,43 @@ pub(super) fn block_capabilities<'c, 'a, 'b>(
                             Capability {
                                 array,
                                 capability_type,
-                                capability_expr: capability_expr.clone(),
-                            },
-                        );
-                        let inserted = push_capability(
-                            capabilities,
-                            Capability {
-                                array,
-                                capability_type,
                                 capability_expr,
                             },
                         );
-                        if inserted {
-                            println!(
-                                "[block_capabilities] propagated unchanged capability: {}",
-                                capabilities.last().unwrap()
-                            );
-                        } else {
-                            println!("[block_capabilities] unchanged capability already covered");
-                        }
                     }
                 }
             }
-            capability_map.insert(current.to_raw().ptr, loop_capabilities);
+
+            let loop_capabilities = coalesce_capabilities(loop_capabilities);
+            capability_map.insert(current.to_raw().ptr, loop_capabilities.clone());
+
+            for loop_capability in loop_capabilities {
+                let Capability {
+                    array,
+                    capability_type,
+                    capability_expr,
+                } = loop_capability;
+                let capability_expr = match capability_expr {
+                    Some((start, end))
+                        if has_iteration_variable(&start) || has_iteration_variable(&end) =>
+                    {
+                        let lower_bound = lower_bound.as_ref().unwrap();
+                        start
+                            .promote(lower_bound, parent_for_loop)
+                            .zip(end.promote(lower_bound, parent_for_loop))
+                    }
+                    capability_expr => capability_expr,
+                };
+                let enclosing_capability = Capability {
+                    array,
+                    capability_type,
+                    capability_expr,
+                };
+                let inserted = push_capability(capabilities, enclosing_capability);
+                println!(
+                    "[block_capabilities] pushed coalesced loop capability; inserted={inserted}"
+                );
+            }
         }
         
         current_opt = current.next_in_block();
@@ -895,7 +880,6 @@ fn loop_function_capabilities<'c, 'a>(
     capability_type: CapabilityType,
     x: &CapabilityExpr<'c, 'a>,
     y: &CapabilityExpr<'c, 'a>,
-    lower_bound: &CapabilityExpr<'c, 'a>,
     upper_bound_exclusive: &CapabilityExpr<'c, 'a>,
     iteration: &CapabilityExpr<'c, 'a>,
     pattern: Pattern,
@@ -918,45 +902,16 @@ fn loop_function_capabilities<'c, 'a>(
     };
 
     let promoted = match pattern {
-        Pattern::Increasing => {
-            let current_start = x.promote(iteration, Some(for_loop));
-            let first_start = x.promote(lower_bound, Some(for_loop));
-            let last_end = y.promote(&upper_bound, Some(for_loop));
-            current_start.zip(first_start).zip(last_end).map(
-                |((current_start, first_start), last_end)| {
-                    let shared_end = CapabilityExpr::BinOp {
-                        operation: CapabilityOp::Sub,
-                        operands: (
-                            Rc::new(current_start.clone()),
-                            Rc::new(CapabilityExpr::Constant(1)),
-                        ),
-                    };
-                    (current_start, last_end, first_start, shared_end)
-                },
-            )
-        }
-        Pattern::Decreasing => {
-            let current_end = y.promote(iteration, Some(for_loop));
-            let last_start = x.promote(&upper_bound, Some(for_loop));
-            let first_end = y.promote(lower_bound, Some(for_loop));
-            current_end.zip(last_start).zip(first_end).map(
-                |((current_end, last_start), first_end)| {
-                    let shared_start = CapabilityExpr::BinOp {
-                        operation: CapabilityOp::Add,
-                        operands: (
-                            Rc::new(current_end.clone()),
-                            Rc::new(CapabilityExpr::Constant(1)),
-                        ),
-                    };
-                    (last_start, current_end, shared_start, first_end)
-                },
-            )
-        }
+        Pattern::Increasing => x
+            .promote(iteration, Some(for_loop))
+            .zip(y.promote(&upper_bound, Some(for_loop))),
+        Pattern::Decreasing => x
+            .promote(&upper_bound, Some(for_loop))
+            .zip(y.promote(iteration, Some(for_loop))),
         Pattern::Poison => unreachable!(),
     };
 
-    let Some((capability_start, capability_end, shared_start, shared_end)) = promoted
-    else {
+    let Some((capability_start, capability_end)) = promoted else {
         return vec![Capability {
             array,
             capability_type,
@@ -964,21 +919,11 @@ fn loop_function_capabilities<'c, 'a>(
         }];
     };
 
-    let mut capabilities = vec![Capability {
+    vec![Capability {
         array,
         capability_type,
         capability_expr: Some((capability_start, capability_end)),
-    }];
-
-    // if capability_type == CapabilityType::Uniq {
-    //     capabilities.push(Capability {
-    //         array,
-    //         capability_type: CapabilityType::Shrd,
-    //         capability_expr: Some((shared_start, shared_end)),
-    //     });
-    // }
-
-    capabilities
+    }]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -988,68 +933,255 @@ pub(super) enum Pattern {
     Poison,
 }
 
-fn pattern_to_capabilities<'c, 'a>(
-    array: Value<'c, 'a>,
-    capability_type: CapabilityType,
-    x: CapabilityExpr<'c, 'a>,
-    y: CapabilityExpr<'c, 'a>,
-    lower_bound: Rc<CapabilityExpr<'c, 'a>>,
-    upper_bound_exclusive: Rc<CapabilityExpr<'c, 'a>>,
-    pattern: Pattern,
-    parent_for_loop: Option<OperationRef<'c, 'a>>,
-) -> Capability<'c, 'a> {
-    let upper_bound = Rc::new(CapabilityExpr::BinOp {
-        operation: CapabilityOp::Sub,
-        operands: (upper_bound_exclusive, Rc::new(CapabilityExpr::Constant(1))),
-    });
-    let capability_expr = match pattern {
-        Pattern::Increasing => {
-            let x = x.promote(lower_bound.as_ref(), parent_for_loop);
-            let y = y.promote(upper_bound.as_ref(), parent_for_loop);
-            x.zip(y)
-        }
-        Pattern::Decreasing => {
-            let x = x.promote(upper_bound.as_ref(), parent_for_loop);
-            let y = y.promote(lower_bound.as_ref(), parent_for_loop);
-            x.zip(y)
-        }
-        Pattern::Poison => None,
-    };
-    Capability {
-        array,
-        capability_type,
-        capability_expr,
-    }
-}
-fn coalesce_capabilities<'c, 'a>(capabilities: Vec<Capability<'c, 'a>>){
-    let mut capabilities_by_array: HashMap<*const c_void, Capability<'_, '_>> = HashMap::new();
-    for capability in capabilities{
-        capabilities_by_array.insert(capability.array.to_raw().ptr, capability);
+pub(super) fn coalesce_capabilities<'c, 'a>(
+    capabilities: Vec<Capability<'c, 'a>>,
+) -> Vec<Capability<'c, 'a>> {
+    let mut group_indices = HashMap::new();
+    let mut capabilities_by_array: Vec<Vec<Capability<'c, 'a>>> = Vec::new();
+
+    for capability in capabilities {
+        let array = capability.array.to_raw().ptr;
+        let group_index = *group_indices.entry(array).or_insert_with(|| {
+            capabilities_by_array.push(Vec::new());
+            capabilities_by_array.len() - 1
+        });
+        capabilities_by_array[group_index].push(capability);
     }
 
+    capabilities_by_array
+        .into_iter()
+        .flat_map(coalesce_capabilities_by_array)
+        .collect()
 }
-fn coalesce_capabilities_by_array<'c, 'a>(capabilities: &Vec<Capability<'c,'a>>){
+fn solver_proves(solver: &Solver, proposition: &Bool) -> bool {
+    solver.check_assumptions(&[proposition.not()]) == SatResult::Unsat
 }
+
+fn capability_bounds<'c, 'a>(
+    capability: &Capability<'c, 'a>,
+) -> (CapabilityExpr<'c, 'a>, CapabilityExpr<'c, 'a>) {
+    if let Some(bounds) = &capability.capability_expr {
+        return bounds.clone();
+    }
+
+    let memref_type = MemRefType::try_from(capability.array.r#type()).unwrap();
+    let size = match memref_type.dim_size(0).unwrap() {
+        DimSize::Static(size) => i64::try_from(size).unwrap(),
+        DimSize::Dynamic => panic!("Wavelet does not support dynamically sized arrays"),
+    };
+    (
+        CapabilityExpr::Constant(0),
+        CapabilityExpr::Constant(size - 1),
+    )
+}
+
+fn capability_is_always_empty(capability: &Capability<'_, '_>) -> bool {
+    let (start_expr, end_expr) = capability_bounds(capability);
+    let mut assumptions = z3_assumptions(&start_expr);
+    assumptions.extend(z3_assumptions(&end_expr));
+
+    let solver = Solver::new();
+    solver.assert(Bool::and(&assumptions));
+    solver.check() == SatResult::Sat
+        && solver_proves(&solver, &end_expr.to_z3().lt(start_expr.to_z3()))
+}
+
+fn offset_capability_expr<'c, 'a>(
+    expression: &CapabilityExpr<'c, 'a>,
+    operation: CapabilityOp,
+) -> CapabilityExpr<'c, 'a> {
+    CapabilityExpr::BinOp {
+        operation,
+        operands: (
+            Rc::new(expression.clone()),
+            Rc::new(CapabilityExpr::Constant(1)),
+        ),
+    }
+    .simplified()
+}
+
+fn shared_capability<'c, 'a>(
+    array: Value<'c, 'a>,
+    start: CapabilityExpr<'c, 'a>,
+    end: CapabilityExpr<'c, 'a>,
+) -> Capability<'c, 'a> {
+    Capability {
+        array,
+        capability_type: CapabilityType::Shrd,
+        capability_expr: Some((start, end)),
+    }
+}
+
+fn unique_capability<'c, 'a>(
+    array: Value<'c, 'a>,
+    start: CapabilityExpr<'c, 'a>,
+    end: CapabilityExpr<'c, 'a>,
+) -> Capability<'c, 'a> {
+    Capability {
+        array,
+        capability_type: CapabilityType::Uniq,
+        capability_expr: Some((start, end)),
+    }
+}
+
+pub(super) fn coalesce_pair<'c, 'a>(
+    shrd: Capability<'c, 'a>,
+    uniq: &mut Capability<'c, 'a>,
+) -> (
+    Option<Capability<'c, 'a>>,
+    Option<Capability<'c, 'a>>,
+    Option<Capability<'c, 'a>>,
+) {
+    debug_assert_eq!(shrd.array.to_raw().ptr, uniq.array.to_raw().ptr);
+    debug_assert_eq!(shrd.capability_type, CapabilityType::Shrd);
+    debug_assert_eq!(uniq.capability_type, CapabilityType::Uniq);
+
+    if capability_is_always_empty(&shrd) {
+        return (None, None, None);
+    }
+    if capability_is_always_empty(uniq) {
+        return (Some(shrd), None, None);
+    }
+
+    let (shrd_start_expr, shrd_end_expr) = capability_bounds(&shrd);
+    let (uniq_start_expr, uniq_end_expr) = capability_bounds(uniq);
+    let mut assumptions = z3_assumptions(&shrd_start_expr);
+    assumptions.extend(z3_assumptions(&shrd_end_expr));
+    assumptions.extend(z3_assumptions(&uniq_start_expr));
+    assumptions.extend(z3_assumptions(&uniq_end_expr));
+
+    let shrd_start = shrd_start_expr.to_z3();
+    let shrd_end = shrd_end_expr.to_z3();
+    let uniq_start = uniq_start_expr.to_z3();
+    let uniq_end = uniq_end_expr.to_z3();
+
+    let solver = Solver::new();
+    solver.assert(Bool::and(&assumptions));
+    solver.assert(shrd_start.le(&shrd_end));
+    solver.assert(uniq_start.le(&uniq_end));
+    if solver.check() != SatResult::Sat {
+        return (Some(shrd), None, None);
+    }
+    if solver_proves(&solver, &shrd_end.lt(&uniq_start))
+        || solver_proves(&solver, &uniq_end.lt(&shrd_start))
+    {
+        return (Some(shrd), None, None);
+    }
+
+    let one = ast::Int::from_i64(1);
+    let overlaps_or_touches = solver_proves(
+        &solver,
+        &shrd_start.le(&ast::Int::add(&[&uniq_end, &one])),
+    ) && solver_proves(
+        &solver,
+        &uniq_start.le(&ast::Int::add(&[&shrd_end, &one])),
+    );
+    if !overlaps_or_touches {
+        return (Some(shrd), None, None);
+    }
+
+    let uniq_starts_before = solver_proves(&solver, &uniq_start.le(&shrd_start));
+    let shrd_starts_before = solver_proves(&solver, &shrd_start.le(&uniq_start));
+    let uniq_ends_after = solver_proves(&solver, &shrd_end.le(&uniq_end));
+    let shrd_ends_after = solver_proves(&solver, &uniq_end.le(&shrd_end));
+    let array = shrd.array;
+
+    match (
+        uniq_starts_before,
+        shrd_starts_before,
+        uniq_ends_after,
+        shrd_ends_after,
+    ) {
+        (true, _, true, _) => (None, None, None),
+        (true, _, _, true) => (
+            Some(shared_capability(
+                array,
+                offset_capability_expr(&uniq_end_expr, CapabilityOp::Add),
+                shrd_end_expr,
+            )),
+            None,
+            None,
+        ),
+        (_, true, true, _) => (
+            Some(shared_capability(
+                array,
+                shrd_start_expr,
+                offset_capability_expr(&uniq_start_expr, CapabilityOp::Sub),
+            )),
+            None,
+            None,
+        ),
+        (_, true, _, true) => (
+            Some(shared_capability(
+                array.clone(),
+                shrd_start_expr,
+                offset_capability_expr(&uniq_start_expr, CapabilityOp::Sub),
+            )),
+            Some(shared_capability(
+                array,
+                offset_capability_expr(&uniq_end_expr, CapabilityOp::Add),
+                shrd_end_expr,
+            )),
+            None,
+        ),
+        (_, true, false, false) => (
+            Some(shared_capability(
+                array.clone(),
+                shrd_start_expr,
+                offset_capability_expr(&uniq_start_expr, CapabilityOp::Sub),
+            )),
+            None,
+            Some(unique_capability(
+                array,
+                offset_capability_expr(&uniq_end_expr, CapabilityOp::Add),
+                shrd_end_expr,
+            )),
+        ),
+        _ => (Some(shrd), None, None),
+    }
+}
+
+pub(super) fn coalesce_capabilities_by_array<'c, 'a>(
+    capabilities: Vec<Capability<'c, 'a>>,
+) -> Vec<Capability<'c, 'a>> {
+    let (mut shrd_capabilities, uniq_capabilities): (Vec<_>, Vec<_>) = capabilities
+        .into_iter()
+        .filter(|capability| !capability_is_always_empty(capability))
+        .partition(|capability| capability.capability_type == CapabilityType::Shrd);
+    let mut pending_uniq = VecDeque::from(uniq_capabilities);
+    let mut coalesced_capabilities = Vec::new();
+
+    while let Some(mut uniq) = pending_uniq.pop_front() {
+        let mut remaining_shrd = Vec::new();
+        for shrd in shrd_capabilities {
+            let (first, second, generated_uniq) = coalesce_pair(shrd, &mut uniq);
+            remaining_shrd.extend(
+                first
+                    .into_iter()
+                    .chain(second)
+                    .filter(|capability| !capability_is_always_empty(capability)),
+            );
+            pending_uniq.extend(
+                generated_uniq
+                    .into_iter()
+                    .filter(|capability| !capability_is_always_empty(capability)),
+            );
+        }
+        shrd_capabilities = remaining_shrd;
+        coalesced_capabilities.push(uniq);
+    }
+
+    coalesced_capabilities.extend(shrd_capabilities);
+    coalesced_capabilities
+}
+
 pub(super) fn z3_assumptions<'c, 'a>(
     expression: &CapabilityExpr<'c, 'a>,
-    iteration_variable: &ast::Int,
-    for_loop_end: &ast::Int,
-    for_loop_end_value: &Value<'c, 'a>,
 ) -> Vec<Bool> {
     match expression {
         CapabilityExpr::BinOp { operands, .. } => {
-            let mut assumptions = z3_assumptions(
-                &operands.0,
-                iteration_variable,
-                for_loop_end,
-                for_loop_end_value,
-            );
-            assumptions.extend(z3_assumptions(
-                &operands.1,
-                iteration_variable,
-                for_loop_end,
-                for_loop_end_value,
-            ));
+            let mut assumptions = z3_assumptions(&operands.0);
+            assumptions.extend(z3_assumptions(&operands.1));
             assumptions
         }
         CapabilityExpr::Variable {
@@ -1059,9 +1191,7 @@ pub(super) fn z3_assumptions<'c, 'a>(
         | CapabilityExpr::Blackbox {
             signedness: Signedness::Unsigned,
             ..
-        } => vec![expression
-            .to_z3(iteration_variable, for_loop_end, for_loop_end_value)
-            .ge(ast::Int::from_i64(0))],
+        } => vec![expression.to_z3().ge(ast::Int::from_i64(0))],
         CapabilityExpr::Constant(_)
         | CapabilityExpr::Variable {
             signedness: Signedness::Signed,
@@ -1078,28 +1208,28 @@ pub(super) fn z3_for_loop_viability<'c, 'a>(
     end: &CapabilityExpr<'c, 'a>,
     for_loop_end_value: &Value<'c, 'a>,
 ) -> Pattern {
-    let inner_iter_var = ast::Int::new_const("i");
-    let next_iter_var = ast::Int::add(&[&inner_iter_var, &ast::Int::from_i64(1)]);
-    let for_loop_end = ast::Int::new_const("end");
-    let x = start.to_z3(&inner_iter_var, &for_loop_end, for_loop_end_value);
-    let y = end.to_z3(&inner_iter_var, &for_loop_end, for_loop_end_value);
+    let iteration_variable = start
+        .iteration_variable_to_z3()
+        .or_else(|| end.iteration_variable_to_z3());
+    let for_loop_end = value_to_z3(for_loop_end_value);
+    let x = start.to_z3();
+    let y = end.to_z3();
 
-    let x_1 = x.substitute(&[(&inner_iter_var, &next_iter_var)]);
-    let y_1 = y.substitute(&[(&inner_iter_var, &next_iter_var)]);
+    let (x_1, y_1) = if let Some(iteration_variable) = &iteration_variable {
+        let next_iteration = ast::Int::add(&[iteration_variable, &ast::Int::from_i64(1)]);
+        (
+            x.substitute(&[(iteration_variable, &next_iteration)]),
+            y.substitute(&[(iteration_variable, &next_iteration)]),
+        )
+    } else {
+        (x.clone(), y.clone())
+    };
 
-    let mut assumptions = vec![inner_iter_var.lt(&for_loop_end)];
-    assumptions.extend(z3_assumptions(
-        start,
-        &inner_iter_var,
-        &for_loop_end,
-        for_loop_end_value,
-    ));
-    assumptions.extend(z3_assumptions(
-        end,
-        &inner_iter_var,
-        &for_loop_end,
-        for_loop_end_value,
-    ));
+    let mut assumptions = z3_assumptions(start);
+    assumptions.extend(z3_assumptions(end));
+    if let Some(iteration_variable) = &iteration_variable {
+        assumptions.push(iteration_variable.lt(&for_loop_end));
+    }
     let assumption_refs = assumptions.iter().collect::<Vec<_>>();
     let assumption = Bool::and(&assumption_refs);
     let growing_counterexample =
