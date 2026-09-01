@@ -1262,6 +1262,37 @@ fn coalesce_capabilities_by_array_applies_each_unique_to_remaining_shared() {
     assert_eq!(generated_start.to_string(), "arg1 + 3");
     assert_eq!(generated_end.to_string(), "arg2 + 2");
 
+    let shrd = Capability {
+        array,
+        capability_type: CapabilityType::Shrd,
+        capability_expr: Some((
+            CapabilityExpr::Blackbox {
+                value: x2,
+                signedness: wavelet_elab::ir::Signedness::Unsigned,
+            },
+            CapabilityExpr::Constant(9),
+        )),
+    };
+    let mut uniq = Capability {
+        array,
+        capability_type: CapabilityType::Uniq,
+        capability_expr: Some((
+            CapabilityExpr::Blackbox {
+                value: y2,
+                signedness: wavelet_elab::ir::Signedness::Unsigned,
+            },
+            CapabilityExpr::Constant(9),
+        )),
+    };
+    let (first_shrd, second_shrd, generated_uniq) = coalesce_pair(shrd, &mut uniq);
+    assert!(first_shrd.is_none());
+    assert!(second_shrd.is_none());
+    let generated_uniq = generated_uniq.unwrap();
+    assert_eq!(generated_uniq.capability_type, CapabilityType::Uniq);
+    let (generated_start, generated_end) = generated_uniq.capability_expr.unwrap();
+    assert_eq!(generated_start.to_string(), "arg1");
+    assert_eq!(generated_end.constant_propagate(), Some(9));
+
     let iteration = CapabilityExpr::Blackbox {
         value: x2,
         signedness: wavelet_elab::ir::Signedness::Signed,
@@ -1283,13 +1314,13 @@ fn coalesce_capabilities_by_array_applies_each_unique_to_remaining_shared() {
             CapabilityExpr::Constant(7),
         )),
     };
-    let (unchanged_shrd, second_shrd, generated_uniq) = coalesce_pair(shrd, &mut uniq);
-    let (unchanged_start, unchanged_end) = unchanged_shrd
+    let (coalesced_shrd, second_shrd, generated_uniq) = coalesce_pair(shrd, &mut uniq);
+    let (coalesced_start, coalesced_end) = coalesced_shrd
         .unwrap()
         .capability_expr
         .unwrap();
-    assert_eq!(unchanged_start.to_string(), "arg1");
-    assert_eq!(unchanged_end.constant_propagate(), Some(3));
+    assert_eq!(coalesced_start.to_string(), "arg1");
+    assert_eq!(coalesced_end.to_string(), "arg1 + 4 - 1");
     assert!(second_shrd.is_none());
     assert!(generated_uniq.is_none());
 

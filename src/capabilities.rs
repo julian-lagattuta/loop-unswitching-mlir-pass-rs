@@ -1068,18 +1068,6 @@ pub(super) fn coalesce_pair<'c, 'a>(
         return (Some(shrd), None, None);
     }
 
-    let one = ast::Int::from_i64(1);
-    let overlaps_or_touches = solver_proves(
-        &solver,
-        &shrd_start.le(&ast::Int::add(&[&uniq_end, &one])),
-    ) && solver_proves(
-        &solver,
-        &uniq_start.le(&ast::Int::add(&[&shrd_end, &one])),
-    );
-    if !overlaps_or_touches {
-        return (Some(shrd), None, None);
-    }
-
     let uniq_starts_before = solver_proves(&solver, &uniq_start.le(&shrd_start));
     let shrd_starts_before = solver_proves(&solver, &shrd_start.le(&uniq_start));
     let uniq_ends_after = solver_proves(&solver, &shrd_end.le(&uniq_end));
@@ -1137,7 +1125,11 @@ pub(super) fn coalesce_pair<'c, 'a>(
                 shrd_end_expr,
             )),
         ),
-        _ => (Some(shrd), None, None),
+        _ => (
+            None,
+            None,
+            Some(unique_capability(array, shrd_start_expr, shrd_end_expr)),
+        ),
     }
 }
 

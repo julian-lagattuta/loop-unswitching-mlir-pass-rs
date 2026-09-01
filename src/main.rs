@@ -8,6 +8,7 @@ use melior::{
 mod capabilities;
 mod loop_unswitching;
 mod util;
+mod fence_placement;
 mod program_to_wavelet;
 mod rename_variables;
 use capabilities::print_return_expressions;
